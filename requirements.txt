@@ -5,3 +5,6 @@ torch
 torchvision
 tqdm
 yt-dlp
+openai-whisper
+google-genai
+python-dotenv

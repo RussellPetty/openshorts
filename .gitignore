@@ -11,3 +11,8 @@ __pycache__/
 
 # Temporary files
 temp_*.mp4
+
+.DS_Store
+
+.env
+*.json
