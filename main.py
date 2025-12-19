@@ -273,6 +273,8 @@ def download_youtube_video(url, output_dir="."):
     has_cookies = cookies_path and os.path.exists(cookies_path)
     if not has_cookies:
         print("⚠️ No cookies found. This increases the risk of bot detection.")
+    else:
+        print(f"🍪 Using cookies from: {cookies_path}")
         
     for client in clients_to_try:
         print(f"🔄 Attempting extraction with client: {client}...")
@@ -283,7 +285,8 @@ def download_youtube_video(url, output_dir="."):
             'extractor_args': {
                 'youtube': {
                     'player_client': [client, 'web'],
-                    'player_skip': ['webpage', 'configs'] if client in ['android', 'ios'] else []
+                    # Only skip webpage if we have cookies, as webpage is sometimes needed for auth check
+                    # 'player_skip': ['webpage', 'configs'] if client in ['android', 'ios'] else []
                 }
             },
             # Force IPv4 as IPv6 datacenter ranges are often blocked
