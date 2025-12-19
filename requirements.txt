@@ -8,3 +8,7 @@ yt-dlp
 openai-whisper
 google-genai
 python-dotenv
+
+fastapi
+uvicorn
+python-multipart

@@ -15,4 +15,4 @@ temp_*.mp4
 .DS_Store
 
 .env
-*.json
+*_metadata.json

@@ -32,17 +32,16 @@ COPY --from=builder /root/.local /root/.local
 ENV PATH=/root/.local/bin:$PATH
 
 # Copy application code
-COPY main.py .
+COPY . .
 
 # Create directories for input/output videos
-RUN mkdir -p /videos/input /videos/output
+RUN mkdir -p /app/uploads /app/output
 
 # Pre-download YOLO model on build (optional, speeds up first run)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
-# Set working directory for video processing
-WORKDIR /videos
+# Expose FastAPI port
+EXPOSE 8000
 
-ENTRYPOINT ["python", "/app/main.py"]
-CMD ["--help"]
-
+# Run FastAPI app
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
