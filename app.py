@@ -5,15 +5,22 @@ import threading
 import json
 import shutil
 import glob
-import glob
 import time
 import asyncio
-from typing import Dict, Optional, List
+from datetime import datetime
+from typing import Dict, Optional, List, Tuple
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from redis_client import get_redis, close_redis
+from job_store import RedisJobStore
+from models import (
+    JobData, JobStatus, CaptionSettings, CaptionStyleEnum,
+    JobResult, ClipResult, ProcessResponseV2, JobStatusResponse, JobResultResponse
+)
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -30,8 +37,13 @@ JOB_RETENTION_SECONDS = 3600  # 1 hour retention
 # Application State
 job_queue = asyncio.Queue()
 jobs: Dict[str, Dict] = {}
-# Semester to limit concurrency to MAX_CONCURRENT_JOBS
+# Semaphore to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+# V2 API State (Redis-backed)
+job_queue_v2 = asyncio.Queue()
+# Store API keys in memory (not in Redis for security)
+job_api_keys: Dict[str, str] = {}
 
 async def cleanup_jobs():
     """Background task to remove old jobs and files."""
@@ -102,8 +114,20 @@ async def lifespan(app: FastAPI):
     # Start worker and cleanup
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
+
+    # Start v2 worker if Redis available
+    redis = await get_redis()
+    v2_worker_task = None
+    if redis:
+        v2_worker_task = asyncio.create_task(process_queue_v2())
+        print("Redis connected, v2 API enabled")
+    else:
+        print("No REDIS_URL configured, v2 API disabled")
+
     yield
-    # Cleanup (optional: cancel worker)
+
+    # Cleanup
+    await close_redis()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -231,21 +255,341 @@ async def run_job(job_id, job_data):
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
 
+
+# ============= V2 API (Redis-backed) =============
+
+async def process_queue_v2():
+    """Background worker for v2 jobs with Redis persistence."""
+    print(f"v2 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
+    while True:
+        try:
+            job_id = await job_queue_v2.get()
+            await concurrency_semaphore.acquire()
+            print(f"v2 Acquired slot for job: {job_id}")
+            asyncio.create_task(run_job_v2_wrapper(job_id))
+        except Exception as e:
+            print(f"v2 Queue dispatch error: {e}")
+            await asyncio.sleep(1)
+
+
+async def run_job_v2_wrapper(job_id: str):
+    """Wrapper for v2 job execution."""
+    try:
+        redis = await get_redis()
+        if not redis:
+            return
+
+        store = RedisJobStore(redis)
+        job = await store.get_job(job_id)
+
+        if job:
+            await run_job_v2(job_id, job, store)
+    except Exception as e:
+        print(f"v2 Job wrapper error {job_id}: {e}")
+    finally:
+        concurrency_semaphore.release()
+        job_queue_v2.task_done()
+        print(f"v2 Released slot for job: {job_id}")
+
+
+def parse_progress(log_line: str) -> Optional[Tuple[int, str]]:
+    """Parse progress from log line. Returns (percentage, stage) or None."""
+    line_lower = log_line.lower()
+    if "downloading" in line_lower:
+        return (10, "Downloading video")
+    if "transcribing" in line_lower:
+        return (30, "Transcribing audio")
+    if "analyzing" in line_lower or "gemini" in line_lower:
+        return (50, "AI analysis")
+    if "processing clip" in line_lower or "extracting" in line_lower:
+        return (70, "Creating clips")
+    if "clip saved" in line_lower or "saved to" in line_lower:
+        return (90, "Finalizing")
+    return None
+
+
+def enqueue_output_v2(out, job_id: str, store: RedisJobStore, loop):
+    """Reads output from subprocess and updates Redis."""
+    try:
+        for line in iter(out.readline, b''):
+            decoded_line = line.decode('utf-8').strip()
+            if decoded_line:
+                print(f"v2 [Job Output] {decoded_line}")
+                # Schedule async Redis update
+                asyncio.run_coroutine_threadsafe(
+                    store.append_log(job_id, decoded_line),
+                    loop
+                )
+                # Parse and update progress
+                progress = parse_progress(decoded_line)
+                if progress:
+                    asyncio.run_coroutine_threadsafe(
+                        store.update_progress(job_id, progress[0], progress[1]),
+                        loop
+                    )
+    except Exception as e:
+        print(f"v2 Error reading output for job {job_id}: {e}")
+    finally:
+        out.close()
+
+
+async def check_partial_results_v2(job_id: str, output_dir: str, store: RedisJobStore):
+    """Check for partial results during processing."""
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        return
+
+    try:
+        target_json = json_files[0]
+        if os.path.getsize(target_json) == 0:
+            return
+
+        with open(target_json, 'r') as f:
+            data = json.load(f)
+
+        base_name = os.path.basename(target_json).replace('_metadata.json', '')
+        clips = data.get('shorts', [])
+        ready_clips = []
+
+        for i, clip in enumerate(clips):
+            clip_filename = f"{base_name}_clip_{i+1}.mp4"
+            clip_path = os.path.join(output_dir, clip_filename)
+            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                ready_clips.append(ClipResult(
+                    video_url=f"/videos/{job_id}/{clip_filename}",
+                    title=clip.get('video_title_for_youtube_short'),
+                    description_tiktok=clip.get('video_description_for_tiktok'),
+                    description_instagram=clip.get('video_description_for_instagram'),
+                    description_youtube=clip.get('video_title_for_youtube_short')
+                ))
+
+        if ready_clips:
+            await store.set_result(job_id, JobResult(clips=ready_clips))
+    except Exception:
+        pass
+
+
+async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
+    """Finalize completed job."""
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+
+    if json_files:
+        with open(json_files[0], 'r') as f:
+            data = json.load(f)
+
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        clips = data.get('shorts', [])
+        result_clips = []
+
+        for i, clip in enumerate(clips):
+            clip_filename = f"{base_name}_clip_{i+1}.mp4"
+            result_clips.append(ClipResult(
+                video_url=f"/videos/{job_id}/{clip_filename}",
+                title=clip.get('video_title_for_youtube_short'),
+                description_tiktok=clip.get('video_description_for_tiktok'),
+                description_instagram=clip.get('video_description_for_instagram'),
+                description_youtube=clip.get('video_title_for_youtube_short')
+            ))
+
+        await store.set_result(job_id, JobResult(clips=result_clips))
+        await store.set_status(job_id, JobStatus.COMPLETED)
+    else:
+        await store.set_status(job_id, JobStatus.FAILED, "No metadata file generated")
+
+
+async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
+    """Execute v2 job with Redis progress tracking."""
+    await store.set_status(job_id, JobStatus.PROCESSING)
+    await store.append_log(job_id, "Job started by worker.")
+
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+
+    # Build command
+    cmd = ["python", "-u", "main.py", "-u", job_data.input_url, "-o", job_output_dir]
+
+    if job_data.caption_settings.include_captions:
+        style = job_data.caption_settings.style
+        if style and style != CaptionStyleEnum.NONE:
+            cmd.extend(["--caption-style", style.value])
+        if job_data.caption_settings.color:
+            cmd.extend(["--caption-color", job_data.caption_settings.color])
+        if job_data.caption_settings.outline_color:
+            cmd.extend(["--caption-outline-color", job_data.caption_settings.outline_color])
+
+    env = os.environ.copy()
+    # Get API key from in-memory store
+    if job_id in job_api_keys:
+        env["GEMINI_API_KEY"] = job_api_keys[job_id]
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=os.getcwd()
+        )
+
+        # Log reader thread
+        loop = asyncio.get_event_loop()
+        t_log = threading.Thread(
+            target=enqueue_output_v2,
+            args=(process.stdout, job_id, store, loop),
+            daemon=True
+        )
+        t_log.start()
+
+        # Wait for completion with incremental updates
+        while process.poll() is None:
+            await asyncio.sleep(2)
+            await check_partial_results_v2(job_id, job_output_dir, store)
+
+        if process.returncode == 0:
+            await finalize_job_v2(job_id, job_output_dir, store)
+        else:
+            await store.set_status(
+                job_id, JobStatus.FAILED,
+                f"Process failed with exit code {process.returncode}"
+            )
+
+    except Exception as e:
+        await store.set_status(job_id, JobStatus.FAILED, str(e))
+    finally:
+        # Clean up API key from memory
+        if job_id in job_api_keys:
+            del job_api_keys[job_id]
+
+
+@app.post("/api/v2/process", response_model=ProcessResponseV2)
+async def process_v2(
+    request: Request,
+    url: str = Query(..., description="Video URL or YouTube link"),
+    include_captions: bool = Query(True, description="Include captions in output"),
+    caption_style: str = Query("none", description="Caption style"),
+    caption_color: Optional[str] = Query(None, description="Hex color for caption text"),
+    caption_outline_color: Optional[str] = Query(None, description="Hex color for caption outline")
+):
+    """Submit a video for processing (v2 with Redis persistence)."""
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(
+            status_code=503,
+            detail="v2 API requires Redis. Set REDIS_URL environment variable."
+        )
+
+    # Get API key from header, fall back to environment variable
+    api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing Gemini API key. Provide X-Gemini-Key header or set GEMINI_API_KEY env var."
+        )
+
+    # Validate caption style
+    valid_styles = [e.value for e in CaptionStyleEnum]
+    if caption_style not in valid_styles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid caption_style. Must be one of: {valid_styles}"
+        )
+
+    job_id = str(uuid.uuid4())
+    store = RedisJobStore(redis)
+
+    job = JobData(
+        job_id=job_id,
+        status=JobStatus.QUEUED,
+        input_url=url,
+        caption_settings=CaptionSettings(
+            include_captions=include_captions,
+            style=CaptionStyleEnum(caption_style),
+            color=caption_color,
+            outline_color=caption_outline_color
+        ),
+        created_at=datetime.utcnow(),
+        logs=[f"Job {job_id} queued."]
+    )
+
+    await store.create_job(job)
+
+    # Store API key in memory (not in Redis for security)
+    job_api_keys[job_id] = api_key
+
+    await job_queue_v2.put(job_id)
+
+    return ProcessResponseV2(job_id=job_id, status="queued")
+
+
+@app.get("/api/v2/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status_v2(job_id: str):
+    """Get job status and progress."""
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(status_code=503, detail="v2 API requires Redis")
+
+    store = RedisJobStore(redis)
+    job = await store.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        progress_percentage=job.progress_percentage,
+        progress_stage=job.progress_stage,
+        logs=job.logs,
+        created_at=job.created_at.isoformat(),
+        started_at=job.started_at.isoformat() if job.started_at else None,
+        error=job.error
+    )
+
+
+@app.get("/api/v2/jobs/{job_id}/result", response_model=JobResultResponse)
+async def get_job_result_v2(job_id: str):
+    """Get job result (completed videos and metadata)."""
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(status_code=503, detail="v2 API requires Redis")
+
+    store = RedisJobStore(redis)
+    job = await store.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return JobResultResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        result=job.result,
+        completed_at=job.completed_at.isoformat() if job.completed_at else None
+    )
+
+
+# ============= V1 API (In-memory) =============
+
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    caption_style: Optional[str] = Form(None),
+    caption_color: Optional[str] = Form(None),
+    caption_outline_color: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-    
+
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
+        caption_style = body.get("caption_style", caption_style)
+        caption_color = body.get("caption_color", caption_color)
+        caption_outline_color = body.get("caption_outline_color", caption_outline_color)
     
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -281,6 +625,14 @@ async def process_endpoint(
         cmd.extend(["-i", input_path])
 
     cmd.extend(["-o", job_output_dir])
+
+    # Add caption parameters if provided
+    if caption_style and caption_style != 'none':
+        cmd.extend(["--caption-style", caption_style])
+    if caption_color:
+        cmd.extend(["--caption-color", caption_color])
+    if caption_outline_color:
+        cmd.extend(["--caption-outline-color", caption_outline_color])
 
     # Enqueue Job
     jobs[job_id] = {

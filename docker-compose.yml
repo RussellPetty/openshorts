@@ -1,4 +1,14 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: openshorts-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
   backend:
     build: .
     container_name: openshorts-backend
@@ -7,6 +17,10 @@ services:
     volumes:
       - .:/app
       - /app/__pycache__
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
 
   frontend:
@@ -20,3 +34,6 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  redis_data:

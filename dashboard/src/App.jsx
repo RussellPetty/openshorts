@@ -4,6 +4,7 @@ import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
+import CaptionStylePicker from './components/CaptionStylePicker';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -144,6 +145,11 @@ function App() {
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
 
+  // Caption settings
+  const [captionStyle, setCaptionStyle] = useState('none');
+  const [captionColor, setCaptionColor] = useState(null);
+  const [captionOutlineColor, setCaptionOutlineColor] = useState(null);
+
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
     // For now keeping gemini plain for compatibility unless requested.
@@ -233,10 +239,18 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload });
+        body = JSON.stringify({
+          url: data.payload,
+          caption_style: captionStyle,
+          caption_color: captionColor,
+          caption_outline_color: captionOutlineColor
+        });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
+        if (captionStyle) formData.append('caption_style', captionStyle);
+        if (captionColor) formData.append('caption_color', captionColor);
+        if (captionOutlineColor) formData.append('caption_outline_color', captionOutlineColor);
         body = formData;
       }
 
@@ -431,6 +445,18 @@ function App() {
                 </div>
 
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+
+                {/* Caption Style Picker */}
+                <div className="mt-6">
+                  <CaptionStylePicker
+                    selectedStyle={captionStyle}
+                    onStyleChange={setCaptionStyle}
+                    customColor={captionColor}
+                    onColorChange={setCaptionColor}
+                    customOutlineColor={captionOutlineColor}
+                    onOutlineColorChange={setCaptionOutlineColor}
+                  />
+                </div>
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

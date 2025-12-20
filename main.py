@@ -18,6 +18,7 @@ from google import genai
 from google import genai
 from dotenv import load_dotenv
 import json
+from caption_renderer import render_caption_on_frame, extract_words_from_transcript
 
 # Load environment variables
 load_dotenv()
@@ -253,9 +254,11 @@ def download_youtube_video(url, output_dir="."):
     
     return downloaded_file, sanitized_title
 
-def process_video_to_vertical(input_video, final_output_video):
+def process_video_to_vertical(input_video, final_output_video, transcript_words=None,
+                               caption_style=None, caption_color=None, caption_outline_color=None):
     """
     Core logic to convert horizontal video to vertical using scene detection.
+    Optionally renders captions if caption_style is provided.
     """
     script_start_time = time.time()
     
@@ -347,7 +350,17 @@ def process_video_to_vertical(input_video, final_output_video):
                 output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
                 y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
                 output_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
-            
+
+            # Render captions if enabled
+            if caption_style and caption_style != 'none' and transcript_words:
+                current_time = frame_number / fps
+                output_frame = render_caption_on_frame(
+                    output_frame, transcript_words, current_time,
+                    style_name=caption_style,
+                    custom_color=caption_color,
+                    custom_outline_color=caption_outline_color
+                )
+
             ffmpeg_process.stdin.write(output_frame.tobytes())
             frame_number += 1
             pbar.update(1)
@@ -505,6 +518,11 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--caption-style', type=str,
+        choices=['classic', 'boxed', 'yellow', 'minimal', 'bold', 'karaoke', 'neon', 'gradient', 'none'],
+        default='none', help="Caption style preset (default: none)")
+    parser.add_argument('--caption-color', type=str, help="Custom text color in hex (e.g. #FFFFFF)")
+    parser.add_argument('--caption-outline-color', type=str, help="Custom outline color in hex (e.g. #000000)")
     
     args = parser.parse_args()
 
@@ -527,15 +545,28 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
+    # Caption settings
+    caption_style = getattr(args, 'caption_style', 'none')
+    caption_color = getattr(args, 'caption_color', None)
+    caption_outline_color = getattr(args, 'caption_outline_color', None)
+
     # 2. Decision: Analyze clips or process whole?
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
-        process_video_to_vertical(input_video, output_file)
+        # If captions requested but skip_analysis, we need to transcribe for captions
+        transcript_words = None
+        if caption_style and caption_style != 'none':
+            print("📝 Transcribing for captions...")
+            transcript = transcribe_video(input_video)
+            transcript_words = extract_words_from_transcript(transcript)
+        process_video_to_vertical(input_video, output_file, transcript_words,
+                                  caption_style, caption_color, caption_outline_color)
     else:
         # 3. Transcribe
         transcript = transcribe_video(input_video)
-        
+        all_words = extract_words_from_transcript(transcript)
+
         # Get duration
         cap = cv2.VideoCapture(input_video)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -545,11 +576,12 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis
         clips_data = get_viral_clips(transcript, duration)
-        
+
         if not clips_data or 'shorts' not in clips_data:
             print("❌ Failed to identify clips. Converting whole video as fallback.")
             output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
-            process_video_to_vertical(input_video, output_file)
+            process_video_to_vertical(input_video, output_file, all_words,
+                                      caption_style, caption_color, caption_outline_color)
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             
@@ -565,27 +597,39 @@ if __name__ == '__main__':
                 end = clip['end']
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
                 print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-                
+
+                # Filter and adjust words for this clip's time range
+                clip_words = []
+                for word in all_words:
+                    if word['start'] >= start and word['end'] <= end:
+                        # Adjust timestamps relative to clip start
+                        clip_words.append({
+                            'word': word['word'],
+                            'start': word['start'] - start,
+                            'end': word['end'] - start
+                        })
+
                 # Cut clip
                 clip_filename = f"{video_title}_clip_{i+1}.mp4"
                 clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
-                
+
                 # ffmpeg cut
                 # Using re-encoding for precision as requested by strict seconds
                 cut_command = [
-                    'ffmpeg', '-y', 
-                    '-ss', str(start), 
-                    '-to', str(end), 
+                    'ffmpeg', '-y',
+                    '-ss', str(start),
+                    '-to', str(end),
                     '-i', input_video,
                     '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
                     '-c:a', 'aac',
                     clip_temp_path
                 ]
                 subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                
-                # Process vertical
-                success = process_video_to_vertical(clip_temp_path, clip_final_path)
+
+                # Process vertical with captions
+                success = process_video_to_vertical(clip_temp_path, clip_final_path, clip_words,
+                                                    caption_style, caption_color, caption_outline_color)
                 
                 if success:
                     print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
