@@ -49,8 +49,8 @@ export default function KeyInput({ onKeySet, savedKey }) {
                     onClick={handleSave}
                     disabled={!key || isSaved}
                     className={`px-6 rounded-xl font-medium transition-all flex items-center gap-2 ${isSaved
-                            ? 'bg-green-500/20 text-green-400 cursor-default'
-                            : 'bg-primary hover:bg-blue-600 text-white shadow-lg shadow-primary/20'
+                        ? 'bg-green-500/20 text-green-400 cursor-default'
+                        : 'bg-primary hover:bg-blue-600 text-white shadow-lg shadow-primary/20'
                         }`}
                 >
                     {isSaved ? <><Check size={18} /> Ready</> : 'Set Key'}
@@ -58,6 +58,15 @@ export default function KeyInput({ onKeySet, savedKey }) {
             </div>
             <p className="mt-3 text-xs text-zinc-500">
                 Your key is stored locally in your browser for convenience.
+                <br />
+                <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary hover:underline mt-1 inline-block"
+                >
+                    Get your free Gemini API Key here →
+                </a>
             </p>
         </div>
     );
