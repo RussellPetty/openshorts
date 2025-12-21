@@ -54,5 +54,5 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 # Expose FastAPI port
 EXPOSE 8000
 
-# Run FastAPI app
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI app (update yt-dlp at startup to handle YouTube API changes)
+CMD ["sh", "-c", "pip install --quiet --upgrade yt-dlp && uvicorn app:app --host 0.0.0.0 --port 8000"]
