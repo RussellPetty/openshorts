@@ -22,10 +22,6 @@ from models import (
     JobResult, ClipResult, ProcessResponseV2, JobStatusResponse, JobResultResponse
 )
 
-# Import new modules for editor and subtitle features
-import editor
-import subtitles
-
 # Constants
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "output"
@@ -39,6 +35,8 @@ MAX_FILE_SIZE_MB = 500  # 500 MB limit
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
 
 # Application State
+job_queue = asyncio.Queue()
+jobs: Dict[str, Dict] = {}
 # Semaphore to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -47,16 +45,84 @@ job_queue_v2 = asyncio.Queue()
 # Store API keys in memory (not in Redis for security)
 job_api_keys: Dict[str, str] = {}
 
+async def cleanup_jobs():
+    """Background task to remove old jobs and files."""
+    import time
+    print("🧹 Cleanup task started.")
+    while True:
+        try:
+            await asyncio.sleep(300) # Check every 5 minutes
+            now = time.time()
+            
+            # Simple directory cleanup based on modification time
+            # Check OUTPUT_DIR
+            for job_id in os.listdir(OUTPUT_DIR):
+                job_path = os.path.join(OUTPUT_DIR, job_id)
+                if os.path.isdir(job_path):
+                    if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
+                        print(f"🧹 Purging old job: {job_id}")
+                        shutil.rmtree(job_path, ignore_errors=True)
+                        if job_id in jobs:
+                            del jobs[job_id]
+
+            # Cleanup Uploads
+            for filename in os.listdir(UPLOAD_DIR):
+                file_path = os.path.join(UPLOAD_DIR, filename)
+                try:
+                    if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
+                         os.remove(file_path)
+                except Exception: pass
+
+        except Exception as e:
+            print(f"⚠️ Cleanup error: {e}")
+
+async def process_queue():
+    """Background worker to process jobs from the queue with concurrency limit."""
+    print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
+    while True:
+        try:
+            # Wait for a job
+            job_id = await job_queue.get()
+            
+            # Acquire semaphore slot (waits if max jobs are running)
+            await concurrency_semaphore.acquire()
+            print(f"🔄 Acquired slot for job: {job_id}")
+
+            # Process in background task to not block the loop (allowing other slots to fill)
+            asyncio.create_task(run_job_wrapper(job_id))
+            
+        except Exception as e:
+            print(f"❌ Queue dispatch error: {e}")
+            await asyncio.sleep(1)
+
+async def run_job_wrapper(job_id):
+    """Wrapper to run job and release semaphore"""
+    try:
+        job = jobs.get(job_id)
+        if job:
+            await run_job(job_id, job)
+    except Exception as e:
+         print(f"❌ Job wrapper error {job_id}: {e}")
+    finally:
+        # Always release semaphore and mark queue task done
+        concurrency_semaphore.release()
+        job_queue.task_done()
+        print(f"✅ Released slot for job: {job_id}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Start worker and cleanup
+    worker_task = asyncio.create_task(process_queue())
+    cleanup_task = asyncio.create_task(cleanup_jobs())
+
     # Start v2 worker if Redis available
     redis = await get_redis()
     v2_worker_task = None
     if redis:
         v2_worker_task = asyncio.create_task(process_queue_v2())
-        print("✅ Redis connected, V2 API enabled")
+        print("Redis connected, v2 API enabled")
     else:
-        print("⚠️ No REDIS_URL configured, V2 API disabled")
+        print("No REDIS_URL configured, v2 API disabled")
 
     yield
 
@@ -80,18 +146,115 @@ app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 class ProcessRequest(BaseModel):
     url: str
 
-class EditRequest(BaseModel):
-    job_id: str
-    clip_index: int
-    api_key: Optional[str] = None
-    input_filename: Optional[str] = None
+def enqueue_output(out, job_id):
+    """Reads output from a subprocess and appends it to jobs logs."""
+    try:
+        for line in iter(out.readline, b''):
+            decoded_line = line.decode('utf-8').strip()
+            if decoded_line:
+                print(f"📝 [Job Output] {decoded_line}")
+                if job_id in jobs:
+                    jobs[job_id]['logs'].append(decoded_line)
+    except Exception as e:
+        print(f"Error reading output for job {job_id}: {e}")
+    finally:
+        out.close()
 
-class SubtitleRequest(BaseModel):
-    job_id: str
-    clip_index: int
-    position: str = "bottom"  # top, middle, bottom
-    font_size: int = 16
-    input_filename: Optional[str] = None
+async def run_job(job_id, job_data):
+    """Executes the subprocess for a specific job."""
+    
+    cmd = job_data['cmd']
+    env = job_data['env']
+    output_dir = job_data['output_dir']
+    
+    jobs[job_id]['status'] = 'processing'
+    jobs[job_id]['logs'].append("Job started by worker.")
+    print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # Merge stderr to stdout
+            env=env,
+            cwd=os.getcwd()
+        )
+        
+        # We need to capture logs in a thread because Popen isn't async
+        t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
+        t_log.daemon = True
+        t_log.start()
+        
+        # Async wait for process with incremental updates
+        start_wait = time.time()
+        while process.poll() is None:
+            await asyncio.sleep(2)
+            
+            # Check for partial results every 2 seconds
+            # Look for metadata file
+            try:
+                json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                if json_files:
+                    target_json = json_files[0]
+                    # Read metadata (it might be being written to, so simple try/except or just read)
+                    # Use a lock or just robust read? json.load might fail if file is partial.
+                    # Usually main.py writes it once at start (based on my review).
+                    if os.path.getsize(target_json) > 0:
+                        with open(target_json, 'r') as f:
+                            data = json.load(f)
+                            
+                        base_name = os.path.basename(target_json).replace('_metadata.json', '')
+                        clips = data.get('shorts', [])
+                        
+                        # Check which clips actually exist on disk
+                        ready_clips = []
+                        for i, clip in enumerate(clips):
+                             clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                             clip_path = os.path.join(output_dir, clip_filename)
+                             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                                 # Checking if file is growing? For now assume if it exists and main.py moves it there, it's done.
+                                 # main.py writes to temp_... then moves to final name. So presence means ready!
+                                 clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                                 ready_clips.append(clip)
+                        
+                        if ready_clips:
+                             jobs[job_id]['result'] = {'clips': ready_clips}
+            except Exception as e:
+                # Ignore read errors during processing
+                pass
+
+        returncode = process.returncode
+        
+        if returncode == 0:
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['logs'].append("Process finished successfully.")
+            
+            # Find result JSON
+            json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+            if json_files:
+                target_json = json_files[0] 
+                with open(target_json, 'r') as f:
+                    data = json.load(f)
+                
+                # Enhance result with video URLs
+                base_name = os.path.basename(target_json).replace('_metadata.json', '')
+                clips = data.get('shorts', [])
+                for i, clip in enumerate(clips):
+                     clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                     clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                
+                jobs[job_id]['result'] = {'clips': clips}
+            else:
+                 jobs[job_id]['status'] = 'failed'
+                 jobs[job_id]['logs'].append("No metadata file generated.")
+        else:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
+            
+    except Exception as e:
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+
 
 # ============= V2 API (Redis-backed) =============
 
@@ -228,9 +391,7 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
                 description_youtube=clip.get('video_title_for_youtube_short')
             ))
 
-        # Store transcript for editor/subtitle features
-        transcript = data.get('transcript')
-        await store.set_result(job_id, JobResult(clips=result_clips, transcript=transcript))
+        await store.set_result(job_id, JobResult(clips=result_clips))
         await store.set_status(job_id, JobStatus.COMPLETED)
     else:
         await store.set_status(job_id, JobStatus.FAILED, "No metadata file generated")
@@ -406,117 +567,97 @@ async def get_job_result_v2(job_id: str):
     )
 
 
-@app.post("/api/v2/edit")
-async def edit_clip_v2(
-    req: EditRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+# ============= V1 API (In-memory) =============
+
+@app.post("/api/process")
+async def process_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    caption_style: Optional[str] = Form(None),
+    caption_color: Optional[str] = Form(None),
+    caption_outline_color: Optional[str] = Form(None)
 ):
-    """Edit a clip with AI-generated enhancements using Gemini."""
-    redis = await get_redis()
-    if not redis:
-        raise HTTPException(status_code=503, detail="v2 API requires Redis")
-
-    store = RedisJobStore(redis)
-    job = await store.get_job(req.job_id)
-
-    if not job or not job.result or not job.result.clips:
-        raise HTTPException(status_code=404, detail="Job not found or no clips available")
-
-    # Get clip
-    try:
-        clip = job.result.clips[req.clip_index]
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
-
-    # Get video file path
-    filename = clip.video_url.split('/')[-1]
-    input_path = os.path.join(OUTPUT_DIR, req.job_id, req.input_filename or filename)
-
-    if not os.path.exists(input_path):
-        raise HTTPException(status_code=404, detail="Video file not found")
-
-    # Get API key
-    api_key = req.api_key or x_gemini_key or job_api_keys.get(req.job_id)
+    api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
-        raise HTTPException(status_code=400, detail="Gemini API key required")
+        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
-    # Get transcript
-    if not job.result.transcript:
-        raise HTTPException(status_code=400, detail="No transcript available for this job")
+    # Handle JSON body manually for URL payload
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        url = body.get("url")
+        caption_style = body.get("caption_style", caption_style)
+        caption_color = body.get("caption_color", caption_color)
+        caption_outline_color = body.get("caption_outline_color", caption_outline_color)
+    
+    if not url and not file:
+        raise HTTPException(status_code=400, detail="Must provide URL or File")
 
-    try:
-        # Run editor in thread pool (blocking I/O)
-        loop = asyncio.get_event_loop()
-        edited_path = await loop.run_in_executor(
-            None,
-            editor.VideoEditor(api_key).edit_video,
-            input_path,
-            job.result.transcript
-        )
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+    
+    # Prepare Command
+    cmd = ["python", "-u", "main.py"] # -u for unbuffered
+    env = os.environ.copy()
+    env["GEMINI_API_KEY"] = api_key # Override with key from request
+    
+    if url:
+        cmd.extend(["-u", url])
+    else:
+        # Save uploaded file with size limit check
+        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+        
+        # Read file in chunks to check size
+        size = 0
+        limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+        
+        with open(input_path, "wb") as buffer:
+            while content := await file.read(1024 * 1024): # Read 1MB chunks
+                size += len(content)
+                if size > limit_bytes:
+                    os.remove(input_path)
+                    shutil.rmtree(job_output_dir)
+                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                buffer.write(content)
+                
+        cmd.extend(["-i", input_path])
 
-        # Add edited video to job result
-        edited_filename = os.path.basename(edited_path)
-        new_url = f"/videos/{req.job_id}/{edited_filename}"
+    cmd.extend(["-o", job_output_dir])
 
-        return {"success": True, "edited_video_url": new_url}
+    # Add caption parameters if provided
+    if caption_style and caption_style != 'none':
+        cmd.extend(["--caption-style", caption_style])
+    if caption_color:
+        cmd.extend(["--caption-color", caption_color])
+    if caption_outline_color:
+        cmd.extend(["--caption-outline-color", caption_outline_color])
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Edit failed: {str(e)}")
+    # Enqueue Job
+    jobs[job_id] = {
+        'status': 'queued',
+        'logs': [f"Job {job_id} queued."],
+        'cmd': cmd,
+        'env': env,
+        'output_dir': job_output_dir
+    }
+    
+    await job_queue.put(job_id)
+    
+    return {"job_id": job_id, "status": "queued"}
 
-
-@app.post("/api/v2/subtitle")
-async def add_subtitles_v2(req: SubtitleRequest):
-    """Add word-level subtitles to a clip."""
-    redis = await get_redis()
-    if not redis:
-        raise HTTPException(status_code=503, detail="v2 API requires Redis")
-
-    store = RedisJobStore(redis)
-    job = await store.get_job(req.job_id)
-
-    if not job or not job.result or not job.result.clips:
-        raise HTTPException(status_code=404, detail="Job not found or no clips available")
-
-    # Get clip
-    try:
-        clip = job.result.clips[req.clip_index]
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
-
-    # Get video file path
-    filename = clip.video_url.split('/')[-1]
-    input_path = os.path.join(OUTPUT_DIR, req.job_id, req.input_filename or filename)
-
-    if not os.path.exists(input_path):
-        raise HTTPException(status_code=404, detail="Video file not found")
-
-    # Get transcript
-    if not job.result.transcript:
-        raise HTTPException(status_code=400, detail="No transcript available for this job")
-
-    try:
-        # Generate SRT and burn subtitles (blocking I/O)
-        loop = asyncio.get_event_loop()
-        output_path = await loop.run_in_executor(
-            None,
-            subtitles.add_subtitles_to_video,
-            input_path,
-            job.result.transcript,
-            req.position,
-            req.font_size
-        )
-
-        # Return subtitled video URL
-        subtitled_filename = os.path.basename(output_path)
-        new_url = f"/videos/{req.job_id}/{subtitled_filename}"
-
-        return {"success": True, "subtitled_video_url": new_url}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Subtitle failed: {str(e)}")
-
-
-# ============= Social Media Integration =============
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    return {
+        "status": job['status'],
+        "logs": job['logs'],
+        "result": job.get('result')
+    }
 
 class SocialPostRequest(BaseModel):
     job_id: str
@@ -534,36 +675,29 @@ import httpx
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest):
-    # Get job from V2 Redis store
-    redis = await get_redis()
-    if not redis:
-        raise HTTPException(status_code=503, detail="Redis not available")
-
-    store = RedisJobStore(redis)
-    job_data = await store.get_job(req.job_id)
-
-    if not job_data or not job_data.result:
-        raise HTTPException(status_code=404, detail="Job not found or not completed")
-
-    if not job_data.result.clips:
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[req.job_id]
+    if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
-
+        
     try:
-        clip = job_data.result.clips[req.clip_index]
+        clip = job['result']['clips'][req.clip_index]
         # Video URL is relative /videos/..., we need absolute file path
-        # clip.video_url is like "/videos/{job_id}/{filename}"
+        # clip['video_url'] is like "/videos/{job_id}/{filename}"
         # We constructed it as: f"/videos/{job_id}/{clip_filename}"
         # And file is at f"{OUTPUT_DIR}/{job_id}/{clip_filename}"
-
-        filename = clip.video_url.split('/')[-1]
+        
+        filename = clip['video_url'].split('/')[-1]
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-
+        
         if not os.path.exists(file_path):
              raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
 
         # Construct parameters for Upload-Post API
         # Fallbacks
-        final_title = req.title or clip.title or 'Viral Short'
+        final_title = req.title or clip.get('title', 'Viral Short')
         
         # Prepare form data
         url = "https://api.upload-post.com/api/upload"
@@ -580,17 +714,17 @@ async def post_to_socials(req: SocialPostRequest):
         
         # Add Platform specifics
         if "tiktok" in req.platforms:
-             desc = req.tiktok_description or clip.description_tiktok or final_title
+             desc = req.tiktok_description or clip.get('video_description_for_tiktok', final_title)
              data_payload["tiktok_title"] = desc
-
+             
         if "instagram" in req.platforms:
-             desc = req.instagram_description or clip.description_instagram or final_title
+             desc = req.instagram_description or clip.get('video_description_for_instagram', final_title)
              data_payload["instagram_title"] = desc
              data_payload["media_type"] = "REELS"
 
         if "youtube" in req.platforms:
-             yt_title = req.title or clip.title or final_title
-             desc = req.youtube_description or clip.description_youtube or clip.description_instagram or final_title
+             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
+             desc = req.youtube_description or clip.get('video_description_for_instagram', final_title) # Fallback
              data_payload["youtube_title"] = yt_title
              data_payload["youtube_description"] = desc
              data_payload["privacyStatus"] = "public"

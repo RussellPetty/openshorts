@@ -281,6 +281,128 @@ All errors return a JSON object with a `detail` field:
 
 ---
 
+### AI-Enhanced Video Editing
+
+```
+POST /api/v2/edit
+```
+
+Apply AI-powered enhancements to a completed video clip using Gemini.
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | Yes | The job ID from a completed processing job |
+| `clip_index` | integer | Yes | Index of the clip to edit (0-based) |
+| `api_key` | string | No | Gemini API key (if not in header) |
+| `input_filename` | string | No | Specific clip filename to use |
+
+#### Headers
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-Gemini-Key` | No* | Gemini API key (*required if not in body/env) |
+
+#### Example Request
+
+```bash
+curl -X POST "https://your-domain.com/api/v2/edit" \
+  -H "Content-Type: application/json" \
+  -H "X-Gemini-Key: your-gemini-api-key" \
+  -d '{
+    "job_id": "93310bfb-7da8-4071-8e51-8fd600cd6575",
+    "clip_index": 0
+  }'
+```
+
+#### Response
+
+```json
+{
+  "success": true,
+  "edited_video_url": "/videos/93310bfb-7da8-4071-8e51-8fd600cd6575/Video_Title_clip_1_edited.mp4"
+}
+```
+
+#### What It Does
+
+- Analyzes clip content with Gemini
+- Applies dynamic zoom effects for emphasis
+- Adds smooth camera transitions
+- Optimizes pacing for viral potential
+
+#### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Edit successful |
+| 400 | Missing API key or invalid parameters |
+| 404 | Job or clip not found |
+| 500 | Edit failed (error in response) |
+| 503 | Redis not configured |
+
+---
+
+### Auto-Generated Subtitles
+
+```
+POST /api/v2/subtitle
+```
+
+Add word-level animated subtitles to a completed video clip.
+
+#### Request Body
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `job_id` | string | Yes | - | The job ID from a completed processing job |
+| `clip_index` | integer | Yes | - | Index of the clip to subtitle (0-based) |
+| `position` | string | No | `bottom` | Subtitle position: `top`, `middle`, `bottom` |
+| `font_size` | integer | No | `16` | Font size in pixels |
+| `input_filename` | string | No | - | Specific clip filename to use |
+
+#### Example Request
+
+```bash
+curl -X POST "https://your-domain.com/api/v2/subtitle" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_id": "93310bfb-7da8-4071-8e51-8fd600cd6575",
+    "clip_index": 0,
+    "position": "bottom",
+    "font_size": 18
+  }'
+```
+
+#### Response
+
+```json
+{
+  "success": true,
+  "subtitled_video_url": "/videos/93310bfb-7da8-4071-8e51-8fd600cd6575/Video_Title_clip_1_subtitled.mp4"
+}
+```
+
+#### What It Does
+
+- Generates SRT subtitle file from transcript
+- Burns subtitles into video with word-level timing
+- Applies professional styling
+- Positions text according to parameters
+
+#### Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Subtitles added successfully |
+| 400 | Missing parameters or no transcript |
+| 404 | Job or clip not found |
+| 500 | Subtitle generation failed |
+| 503 | Redis not configured |
+
+---
+
 ## Job Retention
 
 - Jobs are stored in Redis with a **24-hour TTL**

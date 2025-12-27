@@ -40,6 +40,7 @@ class ClipResult(BaseModel):
 
 class JobResult(BaseModel):
     clips: List[ClipResult] = []
+    transcript: Optional[dict] = None  # For editor/subtitle features
 
 
 class JobData(BaseModel):

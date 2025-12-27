@@ -4,6 +4,7 @@ import scenedetect
 import subprocess
 import argparse
 import re
+import sys
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from ultralytics import YOLO
@@ -12,13 +13,15 @@ import os
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
-import yt_dlp
+import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
-from google import genai
 from google import genai
 from dotenv import load_dotenv
 import json
 from caption_renderer import render_caption_on_frame, extract_words_from_transcript
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
 
 # Load environment variables
 load_dotenv()
@@ -64,58 +67,358 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once
+# Load the YOLO model once (Keep for backup or scene analysis if needed)
 model = YOLO('yolov8n.pt')
 
-# Load the Haar Cascade for face detection once
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# --- MediaPipe Setup ---
+# Use standard Face Detection (BlazeFace) for speed
+mp_face_detection = mp.solutions.face_detection
+face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
 
-def analyze_scene_content(video_path, scene_start_time, scene_end_time):
+class SmoothedCameraman:
     """
-    Analyzes the middle frame of a scene to detect people and faces.
+    Handles smooth camera movement.
+    Simplified Logic: "Heavy Tripod"
+    Only moves if the subject leaves the center safe zone.
+    Moves slowly and linearly.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video {video_path}")
+    def __init__(self, output_width, output_height, video_width, video_height):
+        self.output_width = output_width
+        self.output_height = output_height
+        self.video_width = video_width
+        self.video_height = video_height
+        
+        # Initial State
+        self.current_center_x = video_width / 2
+        self.target_center_x = video_width / 2
+        
+        # Calculate crop dimensions once
+        self.crop_height = video_height
+        self.crop_width = int(self.crop_height * ASPECT_RATIO)
+        if self.crop_width > video_width:
+             self.crop_width = video_width
+             self.crop_height = int(self.crop_width / ASPECT_RATIO)
+             
+        # Safe Zone: 20% of the video width
+        # As long as the target is within this zone relative to current center, DO NOT MOVE.
+        self.safe_zone_radius = self.crop_width * 0.25
+
+    def update_target(self, face_box):
+        """
+        Updates the target center based on detected face/person.
+        """
+        if face_box:
+            x, y, w, h = face_box
+            self.target_center_x = x + w / 2
+    
+    def get_crop_box(self, force_snap=False):
+        """
+        Returns the (x1, y1, x2, y2) for the current frame.
+        """
+        if force_snap:
+            self.current_center_x = self.target_center_x
+        else:
+            diff = self.target_center_x - self.current_center_x
+            
+            # SIMPLIFIED LOGIC:
+            # 1. Is the target outside the safe zone?
+            if abs(diff) > self.safe_zone_radius:
+                # 2. If yes, move towards it slowly (Linear Speed)
+                # Determine direction
+                direction = 1 if diff > 0 else -1
+                
+                # Speed: 2 pixels per frame (Slow pan)
+                # If the distance is HUGE (scene change or fast movement), speed up slightly
+                if abs(diff) > self.crop_width * 0.5:
+                    speed = 15.0 # Fast re-frame
+                else:
+                    speed = 3.0  # Slow, steady pan
+                
+                self.current_center_x += direction * speed
+                
+                # Check if we overshot (prevent oscillation)
+                new_diff = self.target_center_x - self.current_center_x
+                if (direction == 1 and new_diff < 0) or (direction == -1 and new_diff > 0):
+                    self.current_center_x = self.target_center_x
+            
+            # If inside safe zone, DO NOTHING (Stationary Camera)
+                
+        # Clamp center
+        half_crop = self.crop_width / 2
+        
+        if self.current_center_x - half_crop < 0:
+            self.current_center_x = half_crop
+        if self.current_center_x + half_crop > self.video_width:
+            self.current_center_x = self.video_width - half_crop
+            
+        x1 = int(self.current_center_x - half_crop)
+        x2 = int(self.current_center_x + half_crop)
+        
+        x1 = max(0, x1)
+        x2 = min(self.video_width, x2)
+        
+        y1 = 0
+        y2 = self.video_height
+        
+        return x1, y1, x2, y2
+
+class SpeakerTracker:
+    """
+    Tracks speakers over time to prevent rapid switching and handle temporary obstructions.
+    """
+    def __init__(self, stabilization_frames=15, cooldown_frames=30):
+        self.active_speaker_id = None
+        self.speaker_scores = {}  # {id: score}
+        self.last_seen = {}       # {id: frame_number}
+        self.locked_counter = 0   # How long we've been locked on current speaker
+        
+        # Hyperparameters
+        self.stabilization_threshold = stabilization_frames # Frames needed to confirm a new speaker
+        self.switch_cooldown = cooldown_frames              # Minimum frames before switching again
+        self.last_switch_frame = -1000
+        
+        # ID tracking
+        self.next_id = 0
+        self.known_faces = [] # [{'id': 0, 'center': x, 'last_frame': 123}]
+
+    def get_target(self, face_candidates, frame_number, width):
+        """
+        Decides which face to focus on.
+        face_candidates: list of {'box': [x,y,w,h], 'score': float}
+        """
+        current_candidates = []
+        
+        # 1. Match faces to known IDs (simple distance tracking)
+        for face in face_candidates:
+            x, y, w, h = face['box']
+            center_x = x + w / 2
+            
+            best_match_id = -1
+            min_dist = width * 0.15 # Reduced matching radius to avoid jumping in groups
+            
+            # Try to match with known faces seen recently
+            for kf in self.known_faces:
+                if frame_number - kf['last_frame'] > 30: # Forgot faces older than 1s (was 2s)
+                    continue
+                    
+                dist = abs(center_x - kf['center'])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match_id = kf['id']
+            
+            # If no match, assign new ID
+            if best_match_id == -1:
+                best_match_id = self.next_id
+                self.next_id += 1
+            
+            # Update known face
+            self.known_faces = [kf for kf in self.known_faces if kf['id'] != best_match_id]
+            self.known_faces.append({'id': best_match_id, 'center': center_x, 'last_frame': frame_number})
+            
+            current_candidates.append({
+                'id': best_match_id,
+                'box': face['box'],
+                'score': face['score']
+            })
+
+        # 2. Update Scores with decay
+        for pid in list(self.speaker_scores.keys()):
+             self.speaker_scores[pid] *= 0.85 # Faster decay (was 0.9)
+             if self.speaker_scores[pid] < 0.1:
+                 del self.speaker_scores[pid]
+
+        # Add new scores
+        for cand in current_candidates:
+            pid = cand['id']
+            # Score is purely based on size (proximity) now that we don't have mouth
+            raw_score = cand['score'] / (width * width * 0.05)
+            self.speaker_scores[pid] = self.speaker_scores.get(pid, 0) + raw_score
+
+        # 3. Determine Best Speaker
+        if not current_candidates:
+            # If no one found, maintain last active speaker if cooldown allows
+            # to avoid black screen or jump to 0,0
+            return None 
+            
+        best_candidate = None
+        max_score = -1
+        
+        for cand in current_candidates:
+            pid = cand['id']
+            total_score = self.speaker_scores.get(pid, 0)
+            
+            # Hysteresis: HUGE Bonus for current active speaker
+            if pid == self.active_speaker_id:
+                total_score *= 3.0 # Sticky factor
+                
+            if total_score > max_score:
+                max_score = total_score
+                best_candidate = cand
+
+        # 4. Decide Switch
+        if best_candidate:
+            target_id = best_candidate['id']
+            
+            if target_id == self.active_speaker_id:
+                self.locked_counter += 1
+                return best_candidate['box']
+            
+            # New person
+            if frame_number - self.last_switch_frame < self.switch_cooldown:
+                old_cand = next((c for c in current_candidates if c['id'] == self.active_speaker_id), None)
+                if old_cand:
+                    return old_cand['box']
+            
+            self.active_speaker_id = target_id
+            self.last_switch_frame = frame_number
+            self.locked_counter = 0
+            return best_candidate['box']
+            
+        return None
+
+def detect_face_candidates(frame):
+    """
+    Returns list of all detected faces using lightweight FaceDetection.
+    """
+    height, width, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_detection.process(rgb_frame)
+    
+    candidates = []
+    
+    if not results.detections:
         return []
+        
+    for detection in results.detections:
+        bboxC = detection.location_data.relative_bounding_box
+        x = int(bboxC.xmin * width)
+        y = int(bboxC.ymin * height)
+        w = int(bboxC.width * width)
+        h = int(bboxC.height * height)
+        
+        candidates.append({
+            'box': [x, y, w, h],
+            'score': w * h # Area as score
+        })
+            
+    return candidates
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+def detect_person_yolo(frame):
+    """
+    Fallback: Detect largest person using YOLO when face detection fails.
+    Returns [x, y, w, h] of the person's 'upper body' approximation.
+    """
+    # Use the globally loaded model
+    results = model(frame, verbose=False, classes=[0]) # class 0 is person
     
-    start_frame = scene_start_time.get_frames()
-    end_frame = scene_end_time.get_frames()
-    middle_frame_number = int(start_frame + (end_frame - start_frame) / 2)
+    if not results:
+        return None
+        
+    best_box = None
+    max_area = 0
     
-    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_number)
-    
-    ret, frame = cap.read()
-    if not ret:
-        cap.release()
-        return []
-
-    results = model([frame], verbose=False)
-    
-    detected_objects = []
-
     for result in results:
         boxes = result.boxes
         for box in boxes:
-            if box.cls[0] == 0:
-                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-                person_box = [x1, y1, x2, y2]
+            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+            w = x2 - x1
+            h = y2 - y1
+            area = w * h
+            
+            if area > max_area:
+                max_area = area
+                # Focus on the top 40% of the person (head/chest) for framing
+                # This approximates where the face is if we can't detect it directly
+                face_h = int(h * 0.4)
+                best_box = [x1, y1, w, face_h]
                 
-                person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-                
-                face_box = None
-                if len(faces) > 0:
-                    fx, fy, fw, fh = faces[0]
-                    face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+    return best_box
 
-                detected_objects.append({'person_box': person_box, 'face_box': face_box})
-                
+def create_general_frame(frame, output_width, output_height):
+    """
+    Creates a 'General Shot' frame: 
+    - Background: Blurred zoom of original
+    - Foreground: Original video scaled to fit width, centered vertically.
+    """
+    orig_h, orig_w = frame.shape[:2]
+    
+    # 1. Background (Fill Height)
+    # Crop center to aspect ratio
+    bg_scale = output_height / orig_h
+    bg_w = int(orig_w * bg_scale)
+    bg_resized = cv2.resize(frame, (bg_w, output_height))
+    
+    # Crop center of background
+    start_x = (bg_w - output_width) // 2
+    if start_x < 0: start_x = 0
+    background = bg_resized[:, start_x:start_x+output_width]
+    if background.shape[1] != output_width:
+        background = cv2.resize(background, (output_width, output_height))
+        
+    # Blur background
+    background = cv2.GaussianBlur(background, (51, 51), 0)
+    
+    # 2. Foreground (Fit Width)
+    scale = output_width / orig_w
+    fg_h = int(orig_h * scale)
+    foreground = cv2.resize(frame, (output_width, fg_h))
+    
+    # 3. Overlay
+    y_offset = (output_height - fg_h) // 2
+    
+    # Clone background to avoid modifying it
+    final_frame = background.copy()
+    final_frame[y_offset:y_offset+fg_h, :] = foreground
+    
+    return final_frame
+
+def analyze_scenes_strategy(video_path, scenes):
+    """
+    Analyzes each scene to determine if it should be TRACK (Single person) or GENERAL (Group/Wide).
+    Returns list of strategies corresponding to scenes.
+    """
+    cap = cv2.VideoCapture(video_path)
+    strategies = []
+    
+    if not cap.isOpened():
+        return ['TRACK'] * len(scenes)
+        
+    for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
+        # Sample 3 frames (start, middle, end)
+        frames_to_check = [
+            start.get_frames() + 5,
+            int((start.get_frames() + end.get_frames()) / 2),
+            end.get_frames() - 5
+        ]
+        
+        face_counts = []
+        for f_idx in frames_to_check:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if not ret: continue
+            
+            # Detect faces
+            candidates = detect_face_candidates(frame)
+            face_counts.append(len(candidates))
+            
+        # Decision Logic
+        if not face_counts:
+            avg_faces = 0
+        else:
+            avg_faces = sum(face_counts) / len(face_counts)
+            
+        # Strategy:
+        # 0 faces -> GENERAL (Landscape/B-roll)
+        # 1 face -> TRACK
+        # > 1.2 faces -> GENERAL (Group)
+        
+        if avg_faces > 1.2 or avg_faces < 0.5:
+            strategies.append('GENERAL')
+        else:
+            strategies.append('TRACK')
+            
     cap.release()
-    return detected_objects
-
+    return strategies
 
 def detect_scenes(video_path):
     video_manager = VideoManager([video_path])
@@ -128,47 +431,6 @@ def detect_scenes(video_path):
     fps = video_manager.get_framerate()
     video_manager.release()
     return scene_list, fps
-
-def get_enclosing_box(boxes):
-    if not boxes:
-        return None
-    min_x = min(box[0] for box in boxes)
-    min_y = min(box[1] for box in boxes)
-    max_x = max(box[2] for box in boxes)
-    max_y = max(box[3] for box in boxes)
-    return [min_x, min_y, max_x, max_y]
-
-def decide_cropping_strategy(scene_analysis, frame_height):
-    num_people = len(scene_analysis)
-    if num_people == 0:
-        return 'LETTERBOX', None
-    if num_people == 1:
-        target_box = scene_analysis[0]['face_box'] or scene_analysis[0]['person_box']
-        return 'TRACK', target_box
-    person_boxes = [obj['person_box'] for obj in scene_analysis]
-    group_box = get_enclosing_box(person_boxes)
-    group_width = group_box[2] - group_box[0]
-    max_width_for_crop = frame_height * ASPECT_RATIO
-    if group_width < max_width_for_crop:
-        return 'TRACK', group_box
-    else:
-        return 'LETTERBOX', None
-
-def calculate_crop_box(target_box, frame_width, frame_height):
-    target_center_x = (target_box[0] + target_box[2]) / 2
-    crop_height = frame_height
-    crop_width = int(crop_height * ASPECT_RATIO)
-    x1 = int(target_center_x - crop_width / 2)
-    y1 = 0
-    x2 = int(target_center_x + crop_width / 2)
-    y2 = frame_height
-    if x1 < 0:
-        x1 = 0
-        x2 = crop_width
-    if x2 > frame_width:
-        x2 = frame_width
-        x1 = frame_width - crop_width
-    return x1, y1, x2, y2
 
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -192,6 +454,7 @@ def download_youtube_video(url, output_dir="."):
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
     """
+    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
@@ -199,11 +462,14 @@ def download_youtube_video(url, output_dir="."):
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
         print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
-        #print(f"📄 YOUTUBE_COOKIES raw value:\n{cookies_env}")
         try:
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
-            print(f"✅ Cookies written to {cookies_path}")
+            if os.path.exists(cookies_path):
+                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
+                 with open(cookies_path, 'r') as f:
+                     content = f.read(100)
+                     print(f"   Debug: First 100 chars of cookie file: {content}")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
@@ -212,15 +478,64 @@ def download_youtube_video(url, output_dir="."):
         print("⚠️ YOUTUBE_COOKIES env var not found.")
     
     ydl_opts_info = {
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': cookies_path if cookies_path else None
+        'quiet': False,
+        'verbose': True,
+        'no_warnings': False,
+        'cookiefile': cookies_path if cookies_path else None,
+        'sleep_interval_requests': 5,
+        'sleep_interval': 10,
+        'max_sleep_interval': 30,
+        'socket_timeout': 30,
+        'retries': 10,
+        'nocheckcertificate': True,
+        'force_ipv4': True,
+        'cachedir': False,
+        'extractor_args': {'youtube': {'player_client': ['web']}},
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
     with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-        info = ydl.extract_info(url, download=False)
-        video_title = info.get('title', 'youtube_video')
-        sanitized_title = sanitize_filename(video_title)
+        try:
+            info = ydl.extract_info(url, download=False)
+            video_title = info.get('title', 'youtube_video')
+            sanitized_title = sanitize_filename(video_title)
+        except Exception as e:
+            # Force print to stderr/stdout immediately so it's captured before crash
+            import sys
+            import traceback
+            
+            # Print minimal error first to ensure something gets out
+            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
+            
+            error_msg = f"""
+            
+❌ ================================================================= ❌
+❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
+❌ ================================================================= ❌
+            
+REASON: YouTube has blocked the download request (Error 429/Unavailable).
+        This is likely a temporary IP ban on this server.
+
+👇 SOLUTION FOR USER 👇
+---------------------------------------------------------------------
+1. Download the video manually to your computer.
+2. Use the 'Upload Video' tab in this app to process it.
+---------------------------------------------------------------------
+
+Technical Details: {str(e)}
+            """
+            # Print to both streams to ensure capture
+            print(error_msg, file=sys.stdout)
+            print(error_msg, file=sys.stderr)
+            
+            # Force flush
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
+            # Wait a split second to allow buffer to drain before raising
+            time.sleep(0.5)
+            
+            raise e
     
     output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
@@ -233,7 +548,8 @@ def download_youtube_video(url, output_dir="."):
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'quiet': False,
-        'no_warnings': True,
+        'verbose': True,
+        'no_warnings': False,
         'overwrites': True,
         'cookiefile': cookies_path if cookies_path else None
     }
@@ -257,7 +573,7 @@ def download_youtube_video(url, output_dir="."):
 def process_video_to_vertical(input_video, final_output_video, transcript_words=None,
                                caption_style=None, caption_color=None, caption_outline_color=None):
     """
-    Core logic to convert horizontal video to vertical using scene detection.
+    Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
     Optionally renders captions if caption_style is provided.
     """
     script_start_time = time.time()
@@ -287,7 +603,7 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
 
     print(f"   ✅ Found {len(scenes)} scenes.")
 
-    print("\n   🧠 Step 2: Analyzing scene content...")
+    print("\n   🧠 Step 2: Preparing Active Tracking...")
     original_width, original_height = get_video_resolution(input_video)
     
     OUTPUT_HEIGHT = original_height
@@ -295,18 +611,14 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
 
-    scenes_analysis = []
-    for i, (start_time, end_time) in enumerate(scenes):
-        analysis = analyze_scene_content(input_video, start_time, end_time)
-        strategy, target_box = decide_cropping_strategy(analysis, original_height)
-        scenes_analysis.append({
-            'start_frame': start_time.get_frames(),
-            'end_frame': end_time.get_frames(),
-            'analysis': analysis,
-            'strategy': strategy,
-            'target_box': target_box
-        })
-
+    # Initialize Cameraman
+    cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
+    
+    # --- New Strategy: Per-Scene Analysis ---
+    print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
+    scene_strategies = analyze_scenes_strategy(input_video, scenes)
+    # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
+    
     print("\n   ✂️ Step 4: Processing video frames...")
     
     command = [
@@ -324,32 +636,63 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
     frame_number = 0
     current_scene_index = 0
     
-    with tqdm(total=total_frames, desc="   Applying Plan") as pbar:
+    # Pre-calculate scene boundaries
+    scene_boundaries = []
+    for s_start, s_end in scenes:
+        scene_boundaries.append((s_start.get_frames(), s_end.get_frames()))
+
+    # Global tracker for single-person shots
+    speaker_tracker = SpeakerTracker(cooldown_frames=30)
+
+    with tqdm(total=total_frames, desc="   Processing", file=sys.stdout) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if current_scene_index < len(scenes_analysis) - 1 and \
-               frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
-                current_scene_index += 1
-
-            scene_data = scenes_analysis[current_scene_index]
-            strategy = scene_data['strategy']
-            target_box = scene_data['target_box']
-
-            if strategy == 'TRACK':
-                crop_box = calculate_crop_box(target_box, original_width, original_height)
-                processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-                output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-            else: # LETTERBOX
-                scale_factor = OUTPUT_WIDTH / original_width
-                scaled_height = int(original_height * scale_factor)
-                scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height))
+            # Update Scene Index
+            if current_scene_index < len(scene_boundaries):
+                start_f, end_f = scene_boundaries[current_scene_index]
+                if frame_number >= end_f and current_scene_index < len(scene_boundaries) - 1:
+                    current_scene_index += 1
+            
+            # Determine Strategy for current frame based on scene
+            current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
+            
+            # Apply Strategy
+            if current_strategy == 'GENERAL':
+                # "Plano General" -> Blur Background + Fit Width
+                output_frame = create_general_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
                 
-                output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-                y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
-                output_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
+                # Reset cameraman/tracker so they don't drift while inactive
+                cameraman.current_center_x = original_width / 2
+                cameraman.target_center_x = original_width / 2
+                
+            else:
+                # "Single Speaker" -> Track & Crop
+                
+                # Detect every 2nd frame for performance
+                if frame_number % 2 == 0:
+                    candidates = detect_face_candidates(frame)
+                    target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
+                    if target_box:
+                        cameraman.update_target(target_box)
+                    else:
+                        person_box = detect_person_yolo(frame)
+                        if person_box:
+                            cameraman.update_target(person_box)
+
+                # Snap camera on scene change to avoid panning from previous scene position
+                is_scene_start = (frame_number == scene_boundaries[current_scene_index][0])
+                
+                x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
+                
+                # Crop
+                if y2 > y1 and x2 > x1:
+                    cropped = frame[y1:y2, x1:x2]
+                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                else:
+                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
             # Render captions if enabled
             if caption_style and caption_style != 'none' and transcript_words:
@@ -383,7 +726,6 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
         subprocess.run(audio_extract_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError:
         print("\n   ❌ Audio extraction failed (maybe no audio?). Proceeding without audio.")
-        # Create silent audio? Or just skip audio merge
         pass
 
     print("\n   ✨ Step 6: Merging...")
@@ -467,9 +809,7 @@ def get_viral_clips(transcript_result, video_duration):
 
     client = genai.Client(api_key=api_key)
     
-    # We use gemini-1.5-flash which is the standard current fast model.
-    # 'gemini-2.5-flash' does not exist in public API as of my knowledge cutoff or might be typo.
-    # Reverting to 'gemini-1.5-flash' to be safe, or use 'gemini-1.5-pro' for better quality.
+    # We use gemini-2.5-flash as requested.
     model_name = 'gemini-2.5-flash' 
     
     print(f"🤖  Initializing Gemini with model: {model_name}")
@@ -495,6 +835,44 @@ def get_viral_clips(transcript_result, video_duration):
             model=model_name,
             contents=prompt
         )
+        
+        # --- Cost Calculation ---
+        try:
+            usage = response.usage_metadata
+            if usage:
+                # Gemini 2.5 Flash Pricing (Dec 2025)
+                # Input: $0.10 per 1M tokens
+                # Output: $0.40 per 1M tokens
+                
+                input_price_per_million = 0.10
+                output_price_per_million = 0.40
+                
+                prompt_tokens = usage.prompt_token_count
+                output_tokens = usage.candidates_token_count
+                
+                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                total_cost = input_cost + output_cost
+                
+                cost_analysis = {
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": output_tokens,
+                    "input_cost": input_cost,
+                    "output_cost": output_cost,
+                    "total_cost": total_cost,
+                    "model": model_name
+                }
+
+                print(f"💰 Token Usage ({model_name}):")
+                print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
+                print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
+                print(f"   - Total Estimated Cost: ${total_cost:.6f}")
+                
+        except Exception as e:
+            print(f"⚠️ Could not calculate cost: {e}")
+            cost_analysis = None
+        # ------------------------
+
         # Clean response if it contains markdown code blocks
         text = response.text
         if text.startswith("```json"):
@@ -503,7 +881,11 @@ def get_viral_clips(transcript_result, video_duration):
             text = text[:-3]
         text = text.strip()
         
-        return json.loads(text)
+        result_json = json.loads(text)
+        if cost_analysis:
+            result_json['cost_analysis'] = cost_analysis
+            
+        return result_json
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
         return None
@@ -519,33 +901,58 @@ if __name__ == '__main__':
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
     parser.add_argument('--caption-style', type=str,
-        choices=['classic', 'boxed', 'yellow', 'minimal', 'bold', 'karaoke', 'neon', 'gradient', 'none'],
-        default='none', help="Caption style preset (default: none)")
+                        choices=['classic', 'boxed', 'yellow', 'minimal', 'bold', 'karaoke', 'neon', 'gradient', 'none'],
+                        default='none', help="Caption style to apply")
     parser.add_argument('--caption-color', type=str, help="Custom text color in hex (e.g. #FFFFFF)")
     parser.add_argument('--caption-outline-color', type=str, help="Custom outline color in hex (e.g. #000000)")
-    
+
     args = parser.parse_args()
 
     script_start_time = time.time()
     
+    def _ensure_dir(path: str) -> str:
+        """Create directory if missing and return the same path."""
+        if path:
+            os.makedirs(path, exist_ok=True)
+        return path
+    
     # 1. Get Input Video
     if args.url:
-        output_dir = args.output if args.output and os.path.isdir(args.output) else "."
-        if args.output and not os.path.isdir(args.output) and not args.skip_analysis:
-             # If output is a filename but we expect multiple clips, use its dir
-             output_dir = os.path.dirname(args.output) or "."
+        # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
+        # For whole-video runs (--skip-analysis), --output can be a file path.
+        if args.output and not args.skip_analysis:
+            output_dir = _ensure_dir(args.output)
+        else:
+            # If output is a directory, use it; if it's a filename, use its directory; else default "."
+            if args.output and os.path.isdir(args.output):
+                output_dir = args.output
+            elif args.output and not os.path.isdir(args.output):
+                output_dir = os.path.dirname(args.output) or "."
+            else:
+                output_dir = "."
         
         input_video, video_title = download_youtube_video(args.url, output_dir)
     else:
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
-        output_dir = os.path.dirname(args.output) if args.output else os.path.dirname(input_video)
+        
+        if args.output and not args.skip_analysis:
+            # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
+            output_dir = _ensure_dir(args.output)
+        else:
+            # If output is a directory, use it; if it's a filename, use its directory; else default to input dir.
+            if args.output and os.path.isdir(args.output):
+                output_dir = args.output
+            elif args.output and not os.path.isdir(args.output):
+                output_dir = os.path.dirname(args.output) or os.path.dirname(input_video)
+            else:
+                output_dir = os.path.dirname(input_video)
 
     if not os.path.exists(input_video):
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
-    # Caption settings
+    # Get caption parameters
     caption_style = getattr(args, 'caption_style', 'none')
     caption_color = getattr(args, 'caption_color', None)
     caption_outline_color = getattr(args, 'caption_outline_color', None)
@@ -554,17 +961,21 @@ if __name__ == '__main__':
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
+
         # If captions requested but skip_analysis, we need to transcribe for captions
         transcript_words = None
         if caption_style and caption_style != 'none':
             print("📝 Transcribing for captions...")
             transcript = transcribe_video(input_video)
             transcript_words = extract_words_from_transcript(transcript)
+
         process_video_to_vertical(input_video, output_file, transcript_words,
                                   caption_style, caption_color, caption_outline_color)
     else:
         # 3. Transcribe
         transcript = transcribe_video(input_video)
+
+        # Extract words for captions
         all_words = extract_words_from_transcript(transcript)
 
         # Get duration
@@ -586,6 +997,7 @@ if __name__ == '__main__':
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             
             # Save metadata
+            clips_data['transcript'] = transcript # Save full transcript for subtitles
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             with open(metadata_file, 'w') as f:
                 json.dump(clips_data, f, indent=2)
@@ -597,29 +1009,18 @@ if __name__ == '__main__':
                 end = clip['end']
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
                 print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-
-                # Filter and adjust words for this clip's time range
-                clip_words = []
-                for word in all_words:
-                    if word['start'] >= start and word['end'] <= end:
-                        # Adjust timestamps relative to clip start
-                        clip_words.append({
-                            'word': word['word'],
-                            'start': word['start'] - start,
-                            'end': word['end'] - start
-                        })
-
+                
                 # Cut clip
                 clip_filename = f"{video_title}_clip_{i+1}.mp4"
                 clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
-
+                
                 # ffmpeg cut
                 # Using re-encoding for precision as requested by strict seconds
                 cut_command = [
-                    'ffmpeg', '-y',
-                    '-ss', str(start),
-                    '-to', str(end),
+                    'ffmpeg', '-y', 
+                    '-ss', str(start), 
+                    '-to', str(end), 
                     '-i', input_video,
                     '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
                     '-c:a', 'aac',
@@ -628,8 +1029,8 @@ if __name__ == '__main__':
                 subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
                 # Process vertical with captions
-                success = process_video_to_vertical(clip_temp_path, clip_final_path, clip_words,
-                                                    caption_style, caption_color, caption_outline_color)
+                success = process_video_to_vertical(clip_temp_path, clip_final_path, all_words,
+                                                      caption_style, caption_color, caption_outline_color)
                 
                 if success:
                     print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
