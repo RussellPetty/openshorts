@@ -463,9 +463,23 @@ def download_youtube_video(url, output_dir="."):
     if cookies_env:
         print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
         try:
+            import base64
+
+            # Check if content is base64 encoded (recommended to avoid Railway line-wrapping issues)
+            cookies_content = cookies_env.strip()
+            if not cookies_content.startswith('#') and not cookies_content.startswith('.'):
+                # Might be base64 encoded - try to decode
+                try:
+                    decoded = base64.b64decode(cookies_content).decode('utf-8')
+                    if '# Netscape' in decoded or '.youtube.com' in decoded:
+                        print("   Debug: Detected base64-encoded cookies, decoding...")
+                        cookies_content = decoded
+                except Exception:
+                    pass  # Not base64, use as-is
+
             # Normalize cookie file format - Railway may convert tabs to spaces
             normalized_lines = []
-            for line in cookies_env.splitlines():
+            for line in cookies_content.splitlines():
                 line = line.strip()
                 if not line:
                     continue
