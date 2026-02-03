@@ -463,13 +463,32 @@ def download_youtube_video(url, output_dir="."):
     if cookies_env:
         print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
         try:
+            # Normalize cookie file format - Railway may convert tabs to spaces
+            normalized_lines = []
+            for line in cookies_env.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # Preserve comment lines
+                if line.startswith('#'):
+                    normalized_lines.append(line)
+                else:
+                    # Split on whitespace and rejoin with tabs (Netscape format requires tabs)
+                    parts = line.split()
+                    if len(parts) >= 7:
+                        # Standard cookie line has 7 fields: domain, flag, path, secure, expiration, name, value
+                        normalized_lines.append('\t'.join(parts))
+                    else:
+                        # Keep line as-is if it doesn't match expected format
+                        normalized_lines.append(line)
+
+            normalized_content = '\n'.join(normalized_lines) + '\n'
+
             with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
+                f.write(normalized_content)
             if os.path.exists(cookies_path):
                  print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
+                 print(f"   Debug: Normalized {len(normalized_lines)} cookie lines")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
