@@ -29,9 +29,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     curl \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    ca-certificates \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js from official binary (nodesource scripts are unreliable)
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then NODE_ARCH="x64"; else NODE_ARCH="$ARCH"; fi \
+    && curl -fsSL "https://nodejs.org/dist/v20.18.3/node-v20.18.3-linux-${NODE_ARCH}.tar.xz" \
+       | tar -xJ -C /usr/local --strip-components=1 \
+    && node --version
 
 # Copy virtual env from builder and make writable for runtime upgrades
 COPY --from=builder /opt/venv /opt/venv
@@ -58,4 +65,4 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 EXPOSE 8000
 
 # Run FastAPI app (update yt-dlp at startup to handle YouTube API changes)
-CMD ["sh", "-c", "pip install --quiet --upgrade 'yt-dlp[default]' && uvicorn app:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "echo 'Node.js:' && node --version && pip install --quiet --upgrade 'yt-dlp[default]' && uvicorn app:app --host 0.0.0.0 --port 8000"]
