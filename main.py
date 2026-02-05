@@ -549,7 +549,7 @@ def download_youtube_video(url, output_dir="."):
         'cachedir': False,
         'extractor_args': {'youtube': {'player_client': ['web']}},
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'js_runtimes': {'nodejs': {}},
+        'js_runtimes': {'node': {}},
     }
     
     with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
@@ -610,7 +610,7 @@ Technical Details: {str(e)}
         'no_warnings': False,
         'overwrites': True,
         'cookiefile': cookies_path if cookies_path else None,
-        'js_runtimes': {'nodejs': {}},
+        'js_runtimes': {'node': {}},
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
