@@ -469,15 +469,20 @@ def download_youtube_video(url, output_dir="."):
 
     def _decode_and_normalize_cookies(raw: str) -> str:
         """Decode (if base64) and normalize cookie content to Netscape format."""
-        content = raw.strip()
+        content = raw.strip().strip('"').strip("'")
+        print(f"   Debug: Cookie input length={len(content)}, starts_with={repr(content[:20])}")
         if not content.startswith('#') and not content.startswith('.'):
             try:
-                decoded = base64.b64decode(content).decode('utf-8')
+                # Strip any whitespace/newlines that Railway might inject
+                cleaned = ''.join(content.split())
+                decoded = base64.b64decode(cleaned).decode('utf-8')
                 if '# Netscape' in decoded or '.youtube.com' in decoded:
                     print("   Debug: Detected base64-encoded cookies, decoding...")
                     content = decoded
-            except Exception:
-                pass
+                else:
+                    print(f"   Debug: Base64 decoded but no cookie markers found")
+            except Exception as e:
+                print(f"   Debug: Base64 decode failed: {e}")
 
         normalized_lines = []
         for line in content.splitlines():
