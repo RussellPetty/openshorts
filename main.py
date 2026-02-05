@@ -495,23 +495,18 @@ def download_youtube_video(url, output_dir="."):
 
         return '\n'.join(normalized_lines) + '\n'
 
-    def _validate_cookie_file(path: str) -> bool:
-        """Validate cookie file can be loaded by http.cookiejar."""
-        try:
-            jar = http.cookiejar.MozillaCookieJar(path)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            print(f"   Debug: Cookie file validated OK, {len(jar)} cookies loaded")
-            return True
-        except Exception as e:
-            print(f"   Debug: Cookie file validation failed: {e}")
-            return False
-
     def _write_cookie_file(path: str, content: str) -> bool:
-        """Write cookie content to file and validate it."""
+        """Write cookie content to file. Validates basic structure."""
         with open(path, 'w') as f:
             f.write(content)
-        print(f"   Debug: Cookies file written. Size: {os.path.getsize(path)} bytes")
-        return _validate_cookie_file(path)
+        size = os.path.getsize(path)
+        # Basic sanity check: file should have content and look like Netscape cookies
+        has_cookies = any(
+            line.strip() and not line.startswith('#')
+            for line in content.splitlines()
+        )
+        print(f"   Debug: Cookies file written. Size: {size} bytes, has_cookies: {has_cookies}")
+        return size > 0 and has_cookies
 
     # Try env var first, then fallback
     cookie_sources = []
@@ -553,7 +548,8 @@ def download_youtube_video(url, output_dir="."):
         'force_ipv4': True,
         'cachedir': False,
         'extractor_args': {'youtube': {'player_client': ['web']}},
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'js_runtimes': {'nodejs': {}},
     }
     
     with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
@@ -613,7 +609,8 @@ Technical Details: {str(e)}
         'verbose': True,
         'no_warnings': False,
         'overwrites': True,
-        'cookiefile': cookies_path if cookies_path else None
+        'cookiefile': cookies_path if cookies_path else None,
+        'js_runtimes': {'nodejs': {}},
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
