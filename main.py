@@ -458,86 +458,50 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    import base64
-    import http.cookiejar
-
-    cookies_path = '/app/cookies.txt'
+    cookies_path = None
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
 
-    # Fallback base64-encoded cookies if env var not set
-    FALLBACK_COOKIES_B64 = "IyBOZXRzY2FwZSBIVFRQIENvb2tpZSBGaWxlCiMgaHR0cHM6Ly9jdXJsLmhheHguc2UvcmZjL2Nvb2tpZV9zcGVjLmh0bWwKIyBUaGlzIGlzIGEgZ2VuZXJhdGVkIGZpbGUhIERvIG5vdCBlZGl0LgoKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDE2NzczMTYJX19TZWN1cmUtMVBTSURUUwlzaWR0cy1DalVCN0lfNjlJZTNYdC03dkpobWRnWFlYR1AwQ05pWnhucV9VOVlfcmd2QlhXR185VXpuYmJLLUxyb19pWVlaRllqSS13S3BQeEFBCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODAxNjc3MzE2CV9fU2VjdXJlLTNQU0lEVFMJc2lkdHMtQ2pVQjdJXzY5SWUzWHQtN3ZKaG1kZ1hZWEdQMENOaVp4bnFfVTlZX3JndkJYV0dfOVV6bmJiSy1Mcm9faVlZWkZZakktd0twUHhBQQoueW91dHViZS5jb20JVFJVRQkvCUZBTFNFCTE4MDQ2MzEyNjMJSFNJRAlBaUJEQmxlaXpSZVJzQ2hqaAoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwNDYzMTI2MwlTU0lECUFfVWE0akxtNlFOTmFJNFFvCi55b3V0dWJlLmNvbQlUUlVFCS8JRkFMU0UJMTgwNDYzMTI2MwlBUElTSUQJcHg2amVVTVpUUWhZUHViNC9BWXBfT1pjenV2UHMzMk52QQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwNDYzMTI2MwlTQVBJU0lECW9oc2FQMTVoejRrVmE1QUcvQVkzdFVueXA2Nm5ra3hNaXkKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDQ2MzEyNjMJX19TZWN1cmUtMVBBUElTSUQJb2hzYVAxNWh6NGtWYTVBRy9BWTN0VW55cDY2bmtreE1peQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwNDYzMTI2MwlfX1NlY3VyZS0zUEFQSVNJRAlvaHNhUDE1aHo0a1ZhNUFHL0FZM3RVbnlwNjZua2t4TWl5Ci55b3V0dWJlLmNvbQlUUlVFCS8JRkFMU0UJMTgwNDYzMTI2MwlTSUQJZy5hMDAwNlFpeXBmM3hiV2MzSnhteXduNHpvNUltQXRHdjNlSkx0ZVRKa2RZRFliTFZUbUZLTE1MWUUzcHV5UThaVjJHYVV5elFvZ0FDZ1lLQWQwU0FSY1NGUUhHWDJNaThMbmptdzVSMVpxODlUaE5uU1JybUJvVkFVRjh5S3JqZm43dFpVOW9nWDhFTUx2T01IYkgwMDc2Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODA0NjMxMjYzCV9fU2VjdXJlLTFQU0lECWcuYTAwMDZRaXlwZjN4YldjM0p4bXl3bjR6bzVJbUF0R3YzZUpMdGVUSmtkWURZYkxWVG1GS2pVOVdFcXZMQWw1cFRFb084dFlQRXdBQ2dZS0Fka1NBUmNTRlFIR1gyTWlFdGd6UFVQTTRqNHU0VXdKcDgycDdCb1ZBVUY4eUtydTNvWngxY01zWVBLX08xZFAzQy0yMDA3NgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwNDYzMTI2MwlfX1NlY3VyZS0zUFNJRAlnLmEwMDA2UWl5cGYzeGJXYzNKeG15d240em81SW1BdEd2M2VKTHRlVEprZFlEWWJMVlRtRktPUE5vSkhpU3pOTml3NC1vV1FQSjV3QUNnWUtBVllTQVJjU0ZRSEdYMk1pcnlvYTdxTlk0eGllU2lXWW9SX0dtaG9WQVVGOHlLcDNscUlCbDgtVWhjRTA4eTJORUxWeDAwNzYKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE3ODU2OTMzMDkJVklTSVRPUl9JTkZPMV9MSVZFCWkwZmhoSWMxc3pRCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxNzg1NjkzMzA5CVZJU0lUT1JfUFJJVkFDWV9NRVRBREFUQQlDZ0pWVXhJRUdnQWdFZyUzRCUzRAoueW91dHViZS5jb20JVFJVRQkvCUZBTFNFCTE4MDE2NzczMTYJU0lEQ0MJQUtFeVh6VU9RRnFmZ2NuUFl3d3kzMG9fMlZGbUdjR2VJV21TWlhjMmZOeUh6RW5RbXFUZkFENTVrVk9EVkUzcUY0RXlNZV9HVVEKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDE2NzczMTYJX19TZWN1cmUtMVBTSURDQwlBS0V5WHpYOTZmY1Y5QXNjSVFuZUxieG81WFNhZk9qa2hiVUJEaGctbWt2a3VBclgwc1JlM2Y4bnVWa2pjeHJibl91UVd1VWRTbGMKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDE2NzczMTYJX19TZWN1cmUtM1BTSURDQwlBS0V5WHpWTUo2VDdzWGJ1c2liMzlxSXBjTk9LajM5N0QtX1JLbzdCZG44UXhLVGh4d3Z4Sm10RVRIOVpaTXNRUUhucExJbGZLUQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgwNDcwMTMxMglQUkVGCWY0PTQwMDAwMDAmZjY9NDAwMDAwMDAmdHo9QW1lcmljYS5OZXdfWW9yayZmNz0xMDAmZjU9MzAwMDAKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDM5MTUwMDUJTE9HSU5fSU5GTwlBRm1tRjJzd1JnSWhBT1o0amw3UXdoX25IM1FWT0J0YXdqaTYzYkt3RDBnWlRISm5PclFuSnZyUEFpRUFqQU11aERudFUxQ0Rzejc3T0xFUk5mMWp1NWh4TEZLMVpLYms2T3R6Y2hJOlFVUTNNak5tZVdNeFJYQnpkVm8wY2tab1JFcFlXR05TY0RVNE1qZHBVelpZTlU5R2RXVlFiMU5EWTFaSlJVdEVjelZtYkRSbGNqRTFhbmczWDFaRlUwUlVOR1pvUkZaQ1F6Vk1ZVE4wTFhOUFgzWkhaekZrU25KcWVUUjBZVVZCVFV4eVoweFNiblZ0YzB0blIyVTJWM1owVFhkYWFIRmpZV3A0UVhCUlZYaExZbmRLTmxCcVZUTlViazR6TkZSMWRIbDFXVVl5WDBsT1FrNUlURXQzZWtKUgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMAlZU0MJeDM5bzBLTkxBSjQKLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxNzcwMTQxMzE1CVNULWwzaGp0dAlzZXNzaW9uX2xvZ2luaW5mbz1BRm1tRjJzd1JnSWhBT1o0amw3UXdoX25IM1FWT0J0YXdqaTYzYkt3RDBnWlRISm5PclFuSnZyUEFpRUFqQU11aERudFUxQ0Rzejc3T0xFUk5mMWp1NWh4TEZLMVpLYms2T3R6Y2hJJTNBUVVRM01qTm1lV014UlhCemRWbzBja1pvUkVwWVdHTlNjRFU0TWpkcFV6WllOVTlHZFdWUWIxTkRZMVpKUlV0RWN6Vm1iRFJsY2pFMWFuZzNYMVpGVTBSVU5HWm9SRlpDUXpWTVlUTjBMWE5QWDNaSFp6RmtTbkpxZVRSMFlVVkJUVXh5WjB4U2JuVnRjMHRuUjJVMlYzWjBUWGRhYUhGallXcDRRWEJSVlhoTFluZEtObEJxVlROVWJrNHpORlIxZEhsMVdVWXlYMGxPUWs1SVRFdDNla0pSCi55b3V0dWJlLmNvbQlUUlVFCS8JRkFMU0UJMTc3MDE0MTMxNglTVC10bGFkY3cJc2Vzc2lvbl9sb2dpbmluZm89QUZtbUYyc3dSZ0loQU9aNGpsN1F3aF9uSDNRVk9CdGF3amk2M2JLd0QwZ1pUSEpuT3JRbkp2clBBaUVBakFNdWhEbnRVMUNEc3o3N09MRVJOZjFqdTVoeExGSzFaS2JrNk90emNoSSUzQVFVUTNNak5tZVdNeFJYQnpkVm8wY2tab1JFcFlXR05TY0RVNE1qZHBVelpZTlU5R2RXVlFiMU5EWTFaSlJVdEVjelZtYkRSbGNqRTFhbmczWDFaRlUwUlVOR1pvUkZaQ1F6Vk1ZVE4wTFhOUFgzWkhaekZrU25KcWVUUjBZVVZCVFV4eVoweFNiblZ0YzB0blIyVTJWM1owVFhkYWFIRmpZV3A0UVhCUlZYaExZbmRLTmxCcVZUTlViazR6TkZSMWRIbDFXVVl5WDBsT1FrNUlURXQzZWtKUgoueW91dHViZS5jb20JVFJVRQkvCUZBTFNFCTE3NzAxNDEzMTcJU1QtdXdpY29iCXNlc3Npb25fbG9naW5pbmZvPUFGbW1GMnN3UmdJaEFPWjRqbDdRd2hfbkgzUVZPQnRhd2ppNjNiS3dEMGdaVEhKbk9yUW5KdnJQQWlFQWpBTXVoRG50VTFDRHN6NzdPTEVSTmYxanU1aHhMRksxWktiazZPdHpjaEklM0FRVVEzTWpObWVXTXhSWEJ6ZFZvMGNrWm9SRXBZV0dOU2NEVTRNamRwVXpaWU5VOUdkV1ZRYjFORFkxWkpSVXRFY3pWbWJEUmxjakUxYW5nM1gxWkZVMFJVTkdab1JGWkNRelZNWVROMExYTlBYM1pIWnpGa1NuSnFlVFIwWVVWQlRVeHlaMHhTYm5WdGMwdG5SMlUyVjNaMFRYZGFhSEZqWVdwNFFYQlJWWGhMWW5kS05sQnFWVE5VYms0ek5GUjFkSGwxV1VZeVgwbE9RazVJVEV0M2VrSlIKLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxNzcwMTQxMzE4CVNULXH1d3ViOQlzZXNzaW9uX2xvZ2luaW5mbz1BRm1tRjJzd1JnSWhBT1o0amw3UXdoX25IM1FWT0J0YXdqaTYzYkt3RDBnWlRISm5PclFuSnZyUEFpRUFqQU11aERudFUxQ0Rzejc3T0xFUk5mMWp1NWh4TEZLMVpLYms2T3R6Y2hJJTNBUVVRM01qTm1lV014UlhCemRWbzBja1pvUkVwWVdHTlNjRFU0TWpkcFV6WllOVTlHZFdWUWIxTkRZMVpKUlV0RWN6Vm1iRFJsY2pFMWFuZzNYMVpGVTBSVU5HWm9SRlpDUXpWTVlUTjBMWE5QWDNaSFp6RmtTbkpxZVRSMFlVVkJUVXh5WjB4U2JuVnRjMHRuUjJVMlYzWjBUWGRhYUhGallXcDRRWEJSVlhoTFluZEtObEJxVlROVWJrNHpORlIxZEhsMVdVWXlYMGxPUWs1SVRFdDNla0pSCg=="
-
-    def _decode_and_normalize_cookies(raw: str) -> str:
-        """Decode (if base64) and normalize cookie content to Netscape format."""
-        content = raw.strip().strip('"').strip("'")
-        print(f"   Debug: Cookie input length={len(content)}, starts_with={repr(content[:20])}")
-        if not content.startswith('#') and not content.startswith('.'):
-            try:
-                # Strip any whitespace/newlines that Railway might inject
-                cleaned = ''.join(content.split())
-                decoded = base64.b64decode(cleaned).decode('utf-8')
-                if '# Netscape' in decoded or '.youtube.com' in decoded:
-                    print("   Debug: Detected base64-encoded cookies, decoding...")
-                    content = decoded
-                else:
-                    print(f"   Debug: Base64 decoded but no cookie markers found")
-            except Exception as e:
-                print(f"   Debug: Base64 decode failed: {e}")
-
-        normalized_lines = []
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith('#'):
-                normalized_lines.append(line)
-            else:
-                parts = line.split()
-                if len(parts) >= 7:
-                    normalized_lines.append('\t'.join(parts))
-                else:
-                    normalized_lines.append(line)
-
-        return '\n'.join(normalized_lines) + '\n'
-
-    def _write_cookie_file(path: str, content: str) -> bool:
-        """Write cookie content to file. Validates basic structure."""
-        with open(path, 'w') as f:
-            f.write(content)
-        size = os.path.getsize(path)
-        # Basic sanity check: file should have content and look like Netscape cookies
-        has_cookies = any(
-            line.strip() and not line.startswith('#')
-            for line in content.splitlines()
-        )
-        print(f"   Debug: Cookies file written. Size: {size} bytes, has_cookies: {has_cookies}")
-        return size > 0 and has_cookies
-
-    # Try env var first, then fallback
-    cookie_sources = []
     if cookies_env:
-        cookie_sources.append(("YOUTUBE_COOKIES env var", cookies_env))
-    cookie_sources.append(("fallback embedded cookies", FALLBACK_COOKIES_B64))
-
-    cookies_path_valid = False
-    for source_name, source_value in cookie_sources:
-        print(f"🍪 Trying cookie source: {source_name}...")
+        import base64
+        cookies_path = '/app/cookies.txt'
+        print("🍪 YOUTUBE_COOKIES env var found, decoding...")
         try:
-            normalized = _decode_and_normalize_cookies(source_value)
-            if _write_cookie_file(cookies_path, normalized):
-                cookies_path_valid = True
-                print(f"   ✅ Using cookies from: {source_name}")
-                break
-            else:
-                print(f"   ⚠️ Cookie source '{source_name}' produced invalid file, trying next...")
-        except Exception as e:
-            print(f"   ⚠️ Failed to process cookie source '{source_name}': {e}")
+            raw = cookies_env.strip().strip('"').strip("'")
+            # Try base64 decode (strip whitespace Railway may inject)
+            cleaned = ''.join(raw.split())
+            try:
+                decoded = base64.b64decode(cleaned).decode('utf-8')
+                if '.youtube.com' in decoded or '# Netscape' in decoded:
+                    raw = decoded
+                    print("   Debug: Base64 decoded successfully")
+            except Exception as e:
+                print(f"   Debug: Not base64 or decode failed: {e}")
 
-    if not cookies_path_valid:
-        print("⚠️ All cookie sources failed. Proceeding without cookies.")
-        cookies_path = None
-        if os.path.exists('/app/cookies.txt'):
-            os.remove('/app/cookies.txt')
+            # Normalize to Netscape tab-separated format
+            lines = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('#'):
+                    lines.append(line)
+                else:
+                    parts = line.split()
+                    if len(parts) >= 7:
+                        lines.append('\t'.join(parts))
+
+            if lines:
+                with open(cookies_path, 'w') as f:
+                    f.write('\n'.join(lines) + '\n')
+                print(f"   ✅ Cookie file written: {len(lines)} lines")
+            else:
+                print("   ⚠️ No valid cookie lines found")
+                cookies_path = None
+        except Exception as e:
+            print(f"   ⚠️ Cookie processing failed: {e}")
+            cookies_path = None
+    else:
+        print("ℹ️ No YOUTUBE_COOKIES env var set, proceeding without cookies")
     
     ydl_opts_info = {
         'quiet': False,
