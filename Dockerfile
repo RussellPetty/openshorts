@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy virtual env from builder
+# Copy virtual env from builder and make writable for runtime upgrades
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -45,8 +45,8 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 
 # Create directories including Ultralytics cache config
 RUN mkdir -p /app/uploads /app/output /tmp/Ultralytics
-# Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache
-RUN chown -R appuser:appuser /app /tmp/Ultralytics
+# Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache, /opt/venv for runtime upgrades
+RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/venv
 
 # Switch to non-root user
 USER appuser
