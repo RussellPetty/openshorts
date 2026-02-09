@@ -672,3 +672,88 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
             
         except Exception as e:
              raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Transcription endpoint — accepts a YouTube URL (or direct video URL) and
+# returns the transcript text. Used by the podcast pipeline.
+# ---------------------------------------------------------------------------
+
+class TranscribeRequest(BaseModel):
+    url: str
+
+class TranscribeResponse(BaseModel):
+    text: str
+    language: str
+    duration_seconds: float
+
+def _download_video(url: str, output_dir: str) -> str:
+    """Download video via yt-dlp (works for YouTube and direct URLs)."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or '').lower()
+    is_youtube = any(h in hostname for h in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
+
+    if not is_youtube:
+        # Direct URL download
+        import urllib.request
+        ext = os.path.splitext(parsed.path)[1] or '.mp4'
+        out = os.path.join(output_dir, f"video{ext}")
+        urllib.request.urlretrieve(url, out)
+        return out
+
+    # YouTube download via yt-dlp
+    output_template = os.path.join(output_dir, "video.%(ext)s")
+    cmd = [
+        "yt-dlp", "-x", "--audio-format", "wav",
+        "-o", output_template, "--no-playlist", url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp failed: {result.stderr}")
+
+    # Find downloaded file
+    for f in os.listdir(output_dir):
+        if f.startswith("video"):
+            return os.path.join(output_dir, f)
+    raise RuntimeError("yt-dlp produced no output file")
+
+
+def _transcribe(video_path: str) -> dict:
+    """Transcribe a local audio/video file with Faster-Whisper."""
+    from faster_whisper import WhisperModel
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, info = model.transcribe(video_path, word_timestamps=False)
+    parts = []
+    total_duration = 0.0
+    for seg in segments:
+        parts.append(seg.text.strip())
+        total_duration = seg.end
+    text = " ".join(parts)
+    return {"text": text, "language": info.language, "duration": total_duration}
+
+
+@app.post("/api/transcribe", response_model=TranscribeResponse)
+async def transcribe_url(req: TranscribeRequest):
+    """Download a video (YouTube or direct URL) and return its transcript."""
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="transcribe_")
+    try:
+        video_path = await asyncio.to_thread(_download_video, req.url, tmp_dir)
+        if not video_path or not os.path.exists(video_path):
+            raise HTTPException(status_code=400, detail="Failed to download video")
+
+        result = await asyncio.to_thread(_transcribe, video_path)
+
+        return TranscribeResponse(
+            text=result["text"],
+            language=result.get("language", "en"),
+            duration_seconds=result.get("duration", 0.0),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
