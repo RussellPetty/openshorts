@@ -13,6 +13,8 @@ import os
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
+import urllib.request
+import urllib.parse
 import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
@@ -449,11 +451,49 @@ def sanitize_filename(filename):
     return filename[:100]
 
 
+def _is_youtube_url(url):
+    """Check if a URL is a YouTube URL."""
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or '').lower()
+    return any(h in hostname for h in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
+
+
+def _download_direct_url(url, output_dir="."):
+    """Download a non-YouTube URL directly using urllib (no yt-dlp overhead)."""
+    print(f"📥 Direct download (non-YouTube): {url}")
+    step_start_time = time.time()
+
+    parsed = urllib.parse.urlparse(url)
+    filename = os.path.basename(parsed.path) or 'video.mp4'
+    if not filename.endswith('.mp4'):
+        filename += '.mp4'
+    sanitized = sanitize_filename(os.path.splitext(filename)[0])
+    output_path = os.path.join(output_dir, f'{sanitized}.mp4')
+
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    with urllib.request.urlopen(req, timeout=300) as resp, open(output_path, 'wb') as f:
+        while True:
+            chunk = resp.read(1024 * 1024)  # 1 MB chunks
+            if not chunk:
+                break
+            f.write(chunk)
+
+    elapsed = time.time() - step_start_time
+    print(f"✅ Downloaded in {elapsed:.2f}s: {output_path}")
+    return output_path, sanitized
+
+
 def download_youtube_video(url, output_dir="."):
     """
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
     """
+    # Bypass yt-dlp entirely for non-YouTube direct URLs (Supabase, S3, etc.)
+    if not _is_youtube_url(url):
+        return _download_direct_url(url, output_dir)
+
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
@@ -516,32 +556,58 @@ def download_youtube_video(url, output_dir="."):
         'nocheckcertificate': True,
         'force_ipv4': True,
         'cachedir': False,
-        'extractor_args': {'youtube': {'player_client': ['web']}},
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'js_runtimes': {'node': {}},
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+    # Retry with escalating player client strategies to avoid bot detection
+    BOT_DETECTION_PATTERNS = ('Sign in to confirm', 'LOGIN_REQUIRED', 'HTTP Error 429')
+    CLIENT_STRATEGIES = [
+        None,                               # Attempt 1: yt-dlp defaults
+        ['android_vr', 'ios'],              # Attempt 2: mobile-only clients
+        ['tv', 'mweb'],                     # Attempt 3: TV/mobile-web clients
+    ]
+
+    info = None
+    successful_strategy = None
+    last_error = None
+
+    for attempt, strategy in enumerate(CLIENT_STRATEGIES, 1):
+        opts = dict(ydl_opts_info)
+        if strategy:
+            opts['extractor_args'] = {'youtube': {'player_client': strategy}}
+
+        strategy_label = ', '.join(strategy) if strategy else 'yt-dlp defaults'
+        print(f"🔄 Attempt {attempt}/{len(CLIENT_STRATEGIES)}: Trying player clients: {strategy_label}")
+
         try:
-            info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'youtube_video')
-            sanitized_title = sanitize_filename(video_title)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                successful_strategy = strategy
+                print(f"   ✅ extract_info succeeded with: {strategy_label}")
+                break
         except Exception as e:
-            # Force print to stderr/stdout immediately so it's captured before crash
-            import sys
-            import traceback
-            
-            # Print minimal error first to ensure something gets out
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
-            
-            error_msg = f"""
-            
+            last_error = e
+            error_str = str(e)
+            is_bot_error = any(pat in error_str for pat in BOT_DETECTION_PATTERNS)
+
+            if is_bot_error and attempt < len(CLIENT_STRATEGIES):
+                print(f"   ⚠️ Bot detection hit: {error_str[:120]}... retrying with next strategy")
+                continue
+            else:
+                # Non-bot error or last attempt — fail immediately
+                import traceback
+                print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
+
+                error_msg = f"""
+
 ❌ ================================================================= ❌
 ❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
 ❌ ================================================================= ❌
-            
+
 REASON: YouTube has blocked the download request (Error 429/Unavailable).
         This is likely a temporary IP ban on this server.
+        Tried {attempt} player client strategies without success.
 
 👇 SOLUTION FOR USER 👇
 ---------------------------------------------------------------------
@@ -551,18 +617,15 @@ REASON: YouTube has blocked the download request (Error 429/Unavailable).
 
 Technical Details: {str(e)}
             """
-            # Print to both streams to ensure capture
-            print(error_msg, file=sys.stdout)
-            print(error_msg, file=sys.stderr)
-            
-            # Force flush
-            sys.stdout.flush()
-            sys.stderr.flush()
-            
-            # Wait a split second to allow buffer to drain before raising
-            time.sleep(0.5)
-            
-            raise e
+                print(error_msg, file=sys.stdout)
+                print(error_msg, file=sys.stderr)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                time.sleep(0.5)
+                raise e
+
+    video_title = info.get('title', 'youtube_video')
+    sanitized_title = sanitize_filename(video_title)
     
     output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
@@ -580,7 +643,12 @@ Technical Details: {str(e)}
         'overwrites': True,
         'cookiefile': cookies_path if cookies_path else None,
         'js_runtimes': {'node': {}},
+        'socket_timeout': 300,
+        'retries': 5,
     }
+    # Propagate the player client strategy that worked during extract_info
+    if successful_strategy:
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': successful_strategy}}
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
