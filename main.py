@@ -983,7 +983,11 @@ def get_viral_clips(transcript_result, video_duration):
             
         return result_json
     except Exception as e:
+        import traceback
         print(f"❌ Gemini Error: {e}")
+        print(f"❌ Gemini Traceback: {traceback.format_exc()}")
+        if 'response' in dir() and hasattr(response, 'text'):
+            print(f"❌ Gemini raw response (first 500 chars): {response.text[:500]}")
         return None
 
 if __name__ == '__main__':
@@ -1085,10 +1089,25 @@ if __name__ == '__main__':
         clips_data = get_viral_clips(transcript, duration)
 
         if not clips_data or 'shorts' not in clips_data:
-            print("❌ Failed to identify clips. Converting whole video as fallback.")
-            output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
+            print("⚠️ Gemini did not return clips. Creating single full-video clip as fallback.")
+            output_file = os.path.join(output_dir, f"{video_title}_clip_1.mp4")
             process_video_to_vertical(input_video, output_file, all_words,
                                       caption_style, caption_color, caption_outline_color)
+            # Write fallback metadata so app.py can finalize the job
+            fallback_metadata = {
+                "shorts": [{
+                    "start": 0,
+                    "end": duration,
+                    "video_title_for_youtube_short": video_title,
+                    "video_description_for_tiktok": "",
+                    "video_description_for_instagram": ""
+                }],
+                "transcript": transcript
+            }
+            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+            with open(metadata_file, 'w') as f:
+                json.dump(fallback_metadata, f, indent=2)
+            print(f"   Saved fallback metadata to {metadata_file}")
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             
