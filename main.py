@@ -32,38 +32,38 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+You are a senior short-form video editor. Read the transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
 
-⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
-- Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
-- Only NUMBERS with decimal point, up to 3 decimals (examples: 0, 1.250, 17.350).
-- Ensure 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
-- Each clip between 15 and 60 s (inclusive).
-- Prefer starting 0.2–0.4 s BEFORE the hook and ending 0.2–0.4 s AFTER the payoff.
-- Use silence moments for natural cuts; never cut in the middle of a word or phrase.
-- STRICTLY FORBIDDEN to use time formats other than absolute seconds.
+⚠️ TIMESTAMP RULES (STRICT):
+- Timestamps must be ABSOLUTE SECONDS from video start (for ffmpeg -ss <start> -to <end>).
+- Numbers only, up to 3 decimals (e.g. 0, 1.250, 17.350).
+- 0 ≤ start < end ≤ {video_duration}
+- Each clip 15–60 seconds.
+- Start 0.2–0.4s BEFORE the hook, end 0.2–0.4s AFTER the payoff.
+- Cut at silence/pauses, never mid-word.
 
 VIDEO_DURATION_SECONDS: {video_duration}
 
-TRANSCRIPT_TEXT (raw):
-{transcript_text}
-
-WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
+WORDS WITH TIMESTAMPS (array of {{w, s, e}} — word, start seconds, end seconds):
 {words_json}
 
-STRICT EXCLUSIONS:
-- No generic intros/outros or purely sponsorship segments unless they contain the hook.
-- No clips < 15 s or > 60 s.
+RULES:
+- Skip generic intros/outros and pure sponsorship segments.
+- No clips shorter than 15s or longer than 60s.
+- You MUST return at least 1 clip. If the video lacks variety, pick the single best 30–60s segment.
+- Detect the video's language and topic. Write descriptions in the SAME language as the video.
+- Descriptions should include a relevant call-to-action that matches the video's topic.
+- Order clips by predicted viral performance (best first).
 
-OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
+OUTPUT — Return ONLY valid JSON, no markdown fences, no comments:
 {{
   "shorts": [
     {{
-      "start": <number in seconds, e.g., 12.340>,
-      "end": <number in seconds, e.g., 37.900>,
-      "video_description_for_tiktok": "<description for TikTok oriented to get views>",
-      "video_description_for_instagram": "<description for Instagram oriented to get views>",
-      "video_title_for_youtube_short": "<title for YouTube Short oriented to get views 100 chars max>"
+      "start": 12.340,
+      "end": 37.900,
+      "video_description_for_tiktok": "<engaging TikTok description with relevant CTA>",
+      "video_description_for_instagram": "<engaging Instagram description with relevant CTA>",
+      "video_title_for_youtube_short": "<YouTube Short title, max 100 chars>"
     }}
   ]
 }}
@@ -922,7 +922,6 @@ def get_viral_clips(transcript_result, video_duration):
 
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
-        transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )
 
