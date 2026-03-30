@@ -445,16 +445,45 @@ async def edit_clip_v2(
         raise HTTPException(status_code=400, detail="No transcript available for this job")
 
     try:
-        # Run editor in thread pool (blocking I/O)
-        loop = asyncio.get_event_loop()
-        edited_path = await loop.run_in_executor(
-            None,
-            editor.VideoEditor(api_key).edit_video,
-            input_path,
-            job.result.transcript
-        )
+        transcript = job.result.transcript
 
-        # Add edited video to job result
+        def do_edit():
+            ve = editor.VideoEditor(api_key)
+
+            # Probe dimensions, fps, duration
+            try:
+                probe_cmd = [
+                    'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate,duration',
+                    '-of', 'json', input_path
+                ]
+                probe_out = subprocess.check_output(probe_cmd).decode()
+                probe_data = json.loads(probe_out)
+                stream = probe_data['streams'][0]
+                w = int(stream.get('width', 1080))
+                h = int(stream.get('height', 1920))
+                fps_str = stream.get('r_frame_rate', '30/1')
+                num, den = fps_str.split('/')
+                fps = float(num) / float(den)
+                duration = float(stream.get('duration', 30))
+            except Exception as probe_err:
+                print(f"⚠️ Could not probe video: {probe_err}")
+                w, h, fps, duration = 1080, 1920, 30.0, 30.0
+
+            # Upload to Gemini and get AI filter
+            video_file = ve.upload_video(input_path)
+            filter_data = ve.get_ffmpeg_filter(video_file, duration, fps=fps, width=w, height=h, transcript=transcript)
+
+            # Write to _edited output path
+            base, ext = os.path.splitext(input_path)
+            output_path = f"{base}_edited{ext}"
+            ve.apply_edits(input_path, output_path, filter_data)
+            return output_path
+
+        # Run blocking work in thread pool
+        loop = asyncio.get_event_loop()
+        edited_path = await loop.run_in_executor(None, do_edit)
+
         edited_filename = os.path.basename(edited_path)
         new_url = f"/videos/{req.job_id}/{edited_filename}"
 
