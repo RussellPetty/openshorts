@@ -25,6 +25,7 @@ from models import (
 # Import new modules for editor and subtitle features
 import editor
 import subtitles
+import cleaner
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -85,6 +86,12 @@ class EditRequest(BaseModel):
     clip_index: int
     api_key: Optional[str] = None
     input_filename: Optional[str] = None
+
+class CleanRequest(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    max_silence_gap: float = 0.5  # seconds; gaps longer than this get trimmed
+    silence_pad: float = 0.15     # seconds of silence to leave at each cut edge
 
 class SubtitleRequest(BaseModel):
     job_id: str
@@ -491,6 +498,47 @@ async def edit_clip_v2(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Edit failed: {str(e)}")
+
+
+@app.post("/api/v2/clean")
+async def clean_clip_v2(req: CleanRequest):
+    """Remove filler words (umm, um, uh, etc.) and dead silence from a clip."""
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(status_code=503, detail="v2 API requires Redis")
+
+    store = RedisJobStore(redis)
+    job = await store.get_job(req.job_id)
+
+    if not job or not job.result or not job.result.clips:
+        raise HTTPException(status_code=404, detail="Job not found or no clips available")
+
+    try:
+        clip = job.result.clips[req.clip_index]
+    except IndexError:
+        raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
+
+    filename = clip.video_url.split('/')[-1]
+    input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+
+    try:
+        base, ext = os.path.splitext(input_path)
+        output_path = f"{base}_cleaned{ext}"
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: cleaner.clean_clip(input_path, output_path, req.max_silence_gap, req.silence_pad)
+        )
+
+        cleaned_filename = os.path.basename(output_path)
+        new_url = f"/videos/{req.job_id}/{cleaned_filename}"
+        return {"success": True, "cleaned_video_url": new_url}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clean failed: {str(e)}")
 
 
 @app.post("/api/v2/subtitle")
