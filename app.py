@@ -457,12 +457,19 @@ async def edit_clip_v2(
         def do_edit():
             ve = editor.VideoEditor(api_key)
 
-            # Probe dimensions, fps, duration
+            # Step 1: Remove filler words and dead silence first
+            base, ext = os.path.splitext(input_path)
+            cleaned_path = f"{base}_cleaned{ext}"
+            print("✂️  Cleaning fillers and dead silence before AI edit...")
+            cleaner.clean_clip(input_path, cleaned_path)
+            edit_input = cleaned_path
+
+            # Step 2: Probe dimensions, fps, duration from cleaned clip
             try:
                 probe_cmd = [
                     'ffprobe', '-v', 'error', '-select_streams', 'v:0',
                     '-show_entries', 'stream=width,height,r_frame_rate,duration',
-                    '-of', 'json', input_path
+                    '-of', 'json', edit_input
                 ]
                 probe_out = subprocess.check_output(probe_cmd).decode()
                 probe_data = json.loads(probe_out)
@@ -477,14 +484,13 @@ async def edit_clip_v2(
                 print(f"⚠️ Could not probe video: {probe_err}")
                 w, h, fps, duration = 1080, 1920, 30.0, 30.0
 
-            # Upload to Gemini and get AI filter
-            video_file = ve.upload_video(input_path)
+            # Step 3: Upload cleaned clip to Gemini and get AI filter
+            video_file = ve.upload_video(edit_input)
             filter_data = ve.get_ffmpeg_filter(video_file, duration, fps=fps, width=w, height=h, transcript=transcript)
 
-            # Write to _edited output path
-            base, ext = os.path.splitext(input_path)
+            # Step 4: Apply AI effects to cleaned clip → _edited output
             output_path = f"{base}_edited{ext}"
-            ve.apply_edits(input_path, output_path, filter_data)
+            ve.apply_edits(edit_input, output_path, filter_data)
             return output_path
 
         # Run blocking work in thread pool
