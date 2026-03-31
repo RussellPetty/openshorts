@@ -414,11 +414,8 @@ async def get_job_result_v2(job_id: str):
 
 
 @app.post("/api/v2/edit")
-async def edit_clip_v2(
-    req: EditRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
-):
-    """Edit a clip with AI-generated enhancements using Gemini."""
+async def edit_clip_v2(req: EditRequest):
+    """Edit a clip by removing filler words and dead silence."""
     redis = await get_redis()
     if not redis:
         raise HTTPException(status_code=503, detail="v2 API requires Redis")
@@ -429,75 +426,25 @@ async def edit_clip_v2(
     if not job or not job.result or not job.result.clips:
         raise HTTPException(status_code=404, detail="Job not found or no clips available")
 
-    # Get clip
     try:
         clip = job.result.clips[req.clip_index]
     except IndexError:
         raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
 
-    # Get video file path
     filename = clip.video_url.split('/')[-1]
     input_path = os.path.join(OUTPUT_DIR, req.job_id, req.input_filename or filename)
 
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail="Video file not found")
 
-    # Get API key
-    api_key = req.api_key or x_gemini_key or job_api_keys.get(req.job_id)
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Gemini API key required")
-
-    # Get transcript
-    if not job.result.transcript:
-        raise HTTPException(status_code=400, detail="No transcript available for this job")
-
     try:
-        transcript = job.result.transcript
+        base, ext = os.path.splitext(input_path)
+        output_path = f"{base}_edited{ext}"
 
-        def do_edit():
-            ve = editor.VideoEditor(api_key)
-
-            # Step 1: Remove filler words and dead silence first
-            base, ext = os.path.splitext(input_path)
-            cleaned_path = f"{base}_cleaned{ext}"
-            print("✂️  Cleaning fillers and dead silence before AI edit...")
-            cleaner.clean_clip(input_path, cleaned_path)
-            edit_input = cleaned_path
-
-            # Step 2: Probe dimensions, fps, duration from cleaned clip
-            try:
-                probe_cmd = [
-                    'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                    '-show_entries', 'stream=width,height,r_frame_rate,duration',
-                    '-of', 'json', edit_input
-                ]
-                probe_out = subprocess.check_output(probe_cmd).decode()
-                probe_data = json.loads(probe_out)
-                stream = probe_data['streams'][0]
-                w = int(stream.get('width', 1080))
-                h = int(stream.get('height', 1920))
-                fps_str = stream.get('r_frame_rate', '30/1')
-                num, den = fps_str.split('/')
-                fps = float(num) / float(den)
-                duration = float(stream.get('duration', 30))
-            except Exception as probe_err:
-                print(f"⚠️ Could not probe video: {probe_err}")
-                w, h, fps, duration = 1080, 1920, 30.0, 30.0
-
-            # Step 3: Upload cleaned clip to Gemini and get AI filter
-            video_file = ve.upload_video(edit_input)
-            filter_data = ve.get_ffmpeg_filter(video_file, duration, fps=fps, width=w, height=h, transcript=transcript)
-
-            # Step 4: Apply AI effects to cleaned clip → _edited output
-            output_path = f"{base}_edited{ext}"
-            ve.apply_edits(edit_input, output_path, filter_data)
-            return output_path
-
-        # Run blocking work in thread pool
         loop = asyncio.get_event_loop()
-        edited_path = await loop.run_in_executor(None, do_edit)
+        await loop.run_in_executor(None, lambda: cleaner.clean_clip(input_path, output_path))
 
-        edited_filename = os.path.basename(edited_path)
+        edited_filename = os.path.basename(output_path)
         new_url = f"/videos/{req.job_id}/{edited_filename}"
 
         return {"success": True, "edited_video_url": new_url}
