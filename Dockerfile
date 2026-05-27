@@ -57,6 +57,7 @@ RUN git clone --depth 1 --single-branch --branch ${BGUTIL_VERSION} \
 # Copy virtual env from builder and make writable for runtime upgrades
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
 
 # Copy application code
 COPY . .
@@ -85,4 +86,4 @@ EXPOSE 8000
 # at startup so it tracks YouTube API changes, then exec uvicorn.
 # yt-dlp's bgutil plugin auto-detects the local provider at 4416.
 # `exec` makes uvicorn PID 1 so SIGTERM still shuts the container down cleanly.
-CMD ["sh", "-c", "echo 'Node.js:' && node --version && node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --port 4416 > /tmp/bgutil.log 2>&1 & pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "echo 'Node.js:' && node --version && node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --port 4416 > /tmp/bgutil.log 2>&1 & pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
