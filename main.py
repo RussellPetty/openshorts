@@ -560,12 +560,15 @@ def download_youtube_video(url, output_dir="."):
         'js_runtimes': {'node': {}},
     }
     
-    # Retry with escalating player client strategies to avoid bot detection
+    # Retry with escalating player client strategies to avoid bot detection.
+    # Only include clients that return HD formats without a PO Token — `tv`, `mweb`,
+    # `tv_simply`, and `ios` alone now strip everything above 360p (DRM + PO Token gates),
+    # so falling back to them silently produces blurry clips.
     BOT_DETECTION_PATTERNS = ('Sign in to confirm', 'LOGIN_REQUIRED', 'HTTP Error 429')
     CLIENT_STRATEGIES = [
         None,                               # Attempt 1: yt-dlp defaults
-        ['android_vr', 'ios'],              # Attempt 2: mobile-only clients
-        ['tv', 'mweb'],                     # Attempt 3: TV/mobile-web clients
+        ['android_vr'],                     # Attempt 2: android_vr returns DASH up to 1080p
+        ['web_safari'],                     # Attempt 3: web_safari returns HLS up to 1080p
     ]
 
     info = None
@@ -631,10 +634,16 @@ Technical Details: {str(e)}
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if os.path.exists(expected_file):
         os.remove(expected_file)
-        print(f"🗑️  Removed existing file to re-download with H.264 codec")
+        print(f"🗑️  Removed existing file to re-download at HD")
     
     ydl_opts = {
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
+        # Highest available resolution; the pipeline re-encodes to H.264 downstream so we
+        # don't constrain source codec (above 1080p YouTube ships VP9/AV1, not H.264).
+        # `bv*`/`b` (instead of `bestvideo`/`best`) lets us pick HLS progressive streams when
+        # DASH isn't available — without this, mobile/web fallback clients fall through to
+        # the 360p single-file mp4. `format_sort` keeps mp4/H.264 preferred when tied on res.
+        'format': 'bv*+ba/b',
+        'format_sort': ['res', 'ext:mp4:m4a', 'codec:h264:m4a', 'proto:https'],
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'quiet': False,
