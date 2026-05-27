@@ -495,6 +495,25 @@ def download_youtube_video(url, output_dir="."):
         return _download_direct_url(url, output_dir)
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
+
+    # One-shot bgutil/POT diagnostic — surfaces whether the local PO Token
+    # server is reachable and whether the Python plugin loaded into yt-dlp.
+    import subprocess
+    try:
+        bgutil_check = subprocess.run(
+            ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '2',
+             'http://127.0.0.1:4416/ping'],
+            capture_output=True, text=True, timeout=5,
+        )
+        print(f"🔍 Debug: bgutil POT server /ping → HTTP {bgutil_check.stdout.strip() or 'ERR'}")
+    except Exception as e:
+        print(f"🔍 Debug: bgutil POT server probe error: {e}")
+    try:
+        from yt_dlp_plugins.extractor import getpot_bgutil_http  # noqa: F401
+        print("🔍 Debug: bgutil-http Python plugin importable ✅")
+    except Exception as e:
+        print(f"🔍 Debug: bgutil-http Python plugin import failed: {e}")
+
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
