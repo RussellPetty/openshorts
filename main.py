@@ -602,8 +602,8 @@ def _download_via_ytdown(url, output_dir="."):
         raise RuntimeError(f"ytdown completion missing fileUrl: {file_url!r}")
 
     # 3) download the merged mp4
-    file_req = urllib.request.Request(file_url, headers={'User-Agent': HEADERS['User-Agent']})
-    with urllib.request.urlopen(file_req, timeout=300) as resp, open(output_template, 'wb') as f:
+    file_req = urllib.request.Request(file_url, headers={'User-Agent': UA})
+    with opener.open(file_req, timeout=300) as resp, open(output_template, 'wb') as f:
         while True:
             chunk = resp.read(1024 * 1024)  # 1 MB
             if not chunk:
