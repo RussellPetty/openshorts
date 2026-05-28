@@ -1,5 +1,6 @@
 opencv-python
-scenedetect[opencv]
+# main.py uses VideoManager which was removed in scenedetect 0.6 — pin to last 0.5.x
+scenedetect[opencv]<0.6
 ultralytics
 torch
 torchvision
