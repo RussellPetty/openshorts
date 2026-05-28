@@ -15,15 +15,21 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir -r requirements.txt
 
+# bgutil POT HTTP server — pull the official prebuilt image instead of
+# building from source. Image ships /app/{build,node_modules} ready to run
+# via `node build/main.js`; we copy /app + its node binary into the final
+# stage. Pinned to 1.3.1 to match the Python plugin.
+FROM brainicism/bgutil-ytdlp-pot-provider:1.3.1 AS bgutil
+
 # Final stage
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg, OpenCV deps, Node.js + git (Node runs yt-dlp's challenge
-# solver and the bgutil POT HTTP server). The libcairo/pango/jpeg/gif/pixman
-# packages are runtime deps of the bgutil `canvas` Node module — without them
-# the POT server crashes on startup with "libcairo.so not found".
+# Install FFmpeg, OpenCV deps, and Node.js for yt-dlp's challenge solver.
+# bgutil's canvas runtime libs (cairo/pango/jpeg/gif/pixman/rsvg) come along
+# for the ride — same packages are also bundled in the brainicism image, but
+# having them here lets us run the bgutil binary with our own Node if needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
@@ -34,7 +40,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     xz-utils \
-    git \
     libcairo2 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
@@ -51,19 +56,15 @@ RUN ARCH=$(dpkg --print-architecture) \
        | tar -xJ -C /usr/local --strip-components=1 \
     && node --version
 
-# bgutil POT HTTP server — yt-dlp's web client needs a PO Token to bypass
-# YouTube's "Sign in to confirm you're not a bot" check from datacenter IPs.
-# Pairs with the bgutil-ytdlp-pot-provider Python plugin (pinned to the same
-# version). Started in the background by the container CMD.
-ENV BGUTIL_VERSION=1.3.1
-ENV BGUTIL_DIR=/opt/bgutil-ytdlp-pot-provider
-RUN git clone --depth 1 --single-branch --branch ${BGUTIL_VERSION} \
-       https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git ${BGUTIL_DIR} \
-    && cd ${BGUTIL_DIR}/server \
-    && npm ci --no-audit --no-fund \
-    && npx tsc \
-    && test -f build/main.js \
-       || (echo "FATAL: bgutil build/main.js missing after tsc" >&2; ls -la build || true; exit 1)
+# Pull the prebuilt bgutil POT server out of the official image: /app contains
+# build/, node_modules/, package.json. We also copy the image's Node 25 binary
+# under a separate name so the bgutil server runs with the runtime it was
+# built and tested against (its native deps were compiled for that ABI).
+ENV BGUTIL_DIR=/opt/bgutil
+COPY --from=bgutil /app ${BGUTIL_DIR}
+COPY --from=bgutil /usr/local/bin/node /usr/local/bin/node-bgutil
+RUN test -f ${BGUTIL_DIR}/build/main.js \
+    && /usr/local/bin/node-bgutil --version
 
 # Copy virtual env from builder and make writable for runtime upgrades
 COPY --from=builder /opt/venv /opt/venv
@@ -79,17 +80,18 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 # Create directories including Ultralytics cache config
 RUN mkdir -p /app/uploads /app/output /tmp/Ultralytics
 
-# Symlink bgutil into appuser's home so the Python plugin's default
-# script-mode lookup path (~/bgutil-ytdlp-pot-provider/server/build/generate_once.js)
-# resolves to our /opt install. Without this the plugin falls back silently
-# when the HTTP server probe fails.
-RUN ln -s /opt/bgutil-ytdlp-pot-provider /app/bgutil-ytdlp-pot-provider
+# Symlink bgutil into appuser's home so the Python plugin's script-mode
+# fallback lookup (~/bgutil-ytdlp-pot-provider/server/*) resolves to our
+# /opt/bgutil install. The HTTP provider is the primary path, but script
+# mode is a useful safety net when the server probe fails.
+RUN mkdir -p /app/bgutil-ytdlp-pot-provider \
+    && ln -s /opt/bgutil /app/bgutil-ytdlp-pot-provider/server
 
 # Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache,
-# /opt/venv for runtime upgrades, /opt/bgutil-ytdlp-pot-provider so the
-# bgutil HTTP server can be started by appuser.
-RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/venv /opt/bgutil-ytdlp-pot-provider \
-    && chown -h appuser:appuser /app/bgutil-ytdlp-pot-provider
+# /opt/venv for runtime upgrades, /opt/bgutil so the bgutil HTTP server can
+# be started by appuser.
+RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/venv /opt/bgutil \
+    && chown -hR appuser:appuser /app/bgutil-ytdlp-pot-provider
 
 # Switch to non-root user
 USER appuser
@@ -106,4 +108,4 @@ EXPOSE 8000
 # bgutil output is piped to the container's stdout (prefixed [bgutil]) so a
 # crash is visible in Railway runtime logs.
 # `exec` makes uvicorn PID 1 so SIGTERM still shuts the container down cleanly.
-CMD ["sh", "-c", "echo 'Node.js:' && node --version && (node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --port 4416 2>&1 | sed -u 's/^/[bgutil] /' &) && pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "echo 'Node.js:' && node --version && echo 'Node.js (bgutil):' && node-bgutil --version && (cd /opt/bgutil && node-bgutil build/main.js --port 4416 2>&1 | sed -u 's/^/[bgutil] /' &) && pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
