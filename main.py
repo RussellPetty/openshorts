@@ -485,14 +485,116 @@ def _download_direct_url(url, output_dir="."):
     return output_path, sanitized
 
 
+def _download_via_ytdown(url, output_dir="."):
+    """
+    Reverse-engineered ytdown.to flow: their backend does the YouTube heavy lifting
+    (PO Tokens, IP rotation, format extraction), and we just consume a clean mp4.
+
+      1) POST app.ytdown.to/proxy.php  body: url=<yt url>      → metadata + mediaItems
+      2) POST app.ytdown.to/proxy.php  body: url=<mediaUrl>    → status: queued|processing|completed
+      3) GET  fileUrl from completion                          → final mp4
+
+    Raises on any failure so the caller can fall back to the local yt-dlp path.
+    """
+    YTDOWN = 'https://app.ytdown.to/proxy.php'
+    HEADERS = {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'Origin': 'https://app.ytdown.to',
+        'Referer': 'https://app.ytdown.to/en28/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'),
+    }
+    import json
+
+    def _post(body_url, timeout=20):
+        data = urllib.parse.urlencode({'url': body_url}).encode()
+        req = urllib.request.Request(YTDOWN, data=data, headers=HEADERS, method='POST')
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    step_start_time = time.time()
+    print(f"📥 Trying ytdown.to fast path for {url}")
+
+    # 1) metadata
+    meta = _post(url).get('api') or {}
+    if meta.get('status') != 'ok' or not meta.get('mediaItems'):
+        raise RuntimeError(f"ytdown metadata bad: status={meta.get('status')!r} items={len(meta.get('mediaItems') or [])}")
+
+    title = meta.get('title') or 'youtube_video'
+    sanitized_title = sanitize_filename(title)
+    output_template = os.path.join(output_dir, f'{sanitized_title}.mp4')
+    if os.path.exists(output_template):
+        os.remove(output_template)
+
+    # Pick the highest-resolution mp4 video item (FHD > HD > SD).
+    _QUALITY_RANK = {'FHD': 4, 'HD': 3, 'SD': 2}
+    video_items = [
+        it for it in meta['mediaItems']
+        if it.get('type') == 'Video' and (it.get('mediaExtension') or '').upper() == 'MP4'
+    ]
+    if not video_items:
+        raise RuntimeError("ytdown returned no mp4 video items")
+    video_items.sort(key=lambda it: (
+        _QUALITY_RANK.get((it.get('mediaQuality') or '').upper(), 0),
+        int((it.get('mediaRes') or '0x0').split('x')[-1] or 0),
+    ), reverse=True)
+    best = video_items[0]
+    print(f"   Selected {best.get('mediaQuality')} ({best.get('mediaRes')}) — {best.get('mediaFileSize')}")
+
+    # 2) start render + poll
+    media_url = best['mediaUrl']
+    deadline = time.time() + 180  # 3-minute cap before we fall back
+    file_url = None
+    poll = 0
+    while time.time() < deadline:
+        poll += 1
+        job = _post(media_url).get('api') or {}
+        status = job.get('status')
+        if status == 'completed':
+            file_url = job.get('fileUrl')
+            print(f"   Render completed after {poll} polls in {time.time() - step_start_time:.1f}s")
+            break
+        if status not in ('queued', 'processing'):
+            raise RuntimeError(f"ytdown unexpected job status: {status!r} (poll {poll})")
+        time.sleep(2)
+    else:
+        raise RuntimeError(f"ytdown render did not complete within 180s ({poll} polls)")
+
+    if not file_url or not file_url.startswith(('http://', 'https://')):
+        raise RuntimeError(f"ytdown completion missing fileUrl: {file_url!r}")
+
+    # 3) download the merged mp4
+    file_req = urllib.request.Request(file_url, headers={'User-Agent': HEADERS['User-Agent']})
+    with urllib.request.urlopen(file_req, timeout=300) as resp, open(output_template, 'wb') as f:
+        while True:
+            chunk = resp.read(1024 * 1024)  # 1 MB
+            if not chunk:
+                break
+            f.write(chunk)
+
+    elapsed = time.time() - step_start_time
+    print(f"✅ ytdown.to fast path done in {elapsed:.2f}s: {output_template}")
+    return output_template, sanitized_title
+
+
 def download_youtube_video(url, output_dir="."):
     """
-    Downloads a YouTube video using yt-dlp.
-    Returns the path to the downloaded video and the video title.
+    Downloads a YouTube video.
+
+    Tries the ytdown.to fast path first (their backend handles YouTube bot detection,
+    PO Tokens, and format extraction; we just consume a clean mp4). If that fails for
+    any reason — service down, rate-limit, video they can't process — falls back to
+    the local yt-dlp + bgutil POT pipeline.
     """
-    # Bypass yt-dlp entirely for non-YouTube direct URLs (Supabase, S3, etc.)
+    # Bypass everything for non-YouTube direct URLs (Supabase, S3, etc.)
     if not _is_youtube_url(url):
         return _download_direct_url(url, output_dir)
+
+    try:
+        return _download_via_ytdown(url, output_dir)
+    except Exception as e:
+        print(f"⚠️  ytdown.to fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
 
