@@ -490,31 +490,68 @@ def _download_via_ytdown(url, output_dir="."):
     Reverse-engineered ytdown.to flow: their backend does the YouTube heavy lifting
     (PO Tokens, IP rotation, format extraction), and we just consume a clean mp4.
 
+      0) GET  app.ytdown.to/en28/                              → PHPSESSID cookie (warmup)
       1) POST app.ytdown.to/proxy.php  body: url=<yt url>      → metadata + mediaItems
       2) POST app.ytdown.to/proxy.php  body: url=<mediaUrl>    → status: queued|processing|completed
       3) GET  fileUrl from completion                          → final mp4
 
+    The warmup GET + cookie jar + full Chrome `sec-ch-ua`/`sec-fetch-*` headers are
+    load-bearing: their Cloudflare layer and PHP backend both penalize cold raw POSTs
+    (observed: server-side cold requests get stuck at `queued 0%` indefinitely; the
+    same flow after a warmup GET enters `processing` on the first poll).
+
     Raises on any failure so the caller can fall back to the local yt-dlp path.
     """
+    import http.cookiejar
+    import json
+
     YTDOWN = 'https://app.ytdown.to/proxy.php'
-    HEADERS = {
+    UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36')
+    COMMON_HEADERS = {
+        'User-Agent': UA,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+    }
+    POST_HEADERS = {
+        **COMMON_HEADERS,
+        'Accept': '*/*',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Origin': 'https://app.ytdown.to',
         'Referer': 'https://app.ytdown.to/en28/',
         'X-Requested-With': 'XMLHttpRequest',
-        'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'),
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'priority': 'u=1, i',
     }
-    import json
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
 
     def _post(body_url, timeout=20):
         data = urllib.parse.urlencode({'url': body_url}).encode()
-        req = urllib.request.Request(YTDOWN, data=data, headers=HEADERS, method='POST')
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        req = urllib.request.Request(YTDOWN, data=data, headers=POST_HEADERS, method='POST')
+        with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
 
     step_start_time = time.time()
     print(f"📥 Trying ytdown.to fast path for {url}")
+
+    # 0) warmup GET — picks up PHPSESSID, mimics a real page-visit-then-XHR flow
+    warmup_req = urllib.request.Request('https://app.ytdown.to/en28/', headers={
+        **COMMON_HEADERS,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+    })
+    with opener.open(warmup_req, timeout=15) as r:
+        r.read()
+    cookie_names = [c.name for c in cookie_jar]
+    print(f"   Warmup cookies: {cookie_names or '(none)'}")
 
     # 1) metadata
     meta = _post(url).get('api') or {}
