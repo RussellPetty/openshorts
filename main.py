@@ -580,17 +580,18 @@ def download_youtube_video(url, output_dir="."):
     }
     
     # Retry with escalating player client strategies to avoid bot detection.
-    # `android_vr` is first because it returns the full DASH ladder (1080p video-only
-    # + m4a audio) without YouTube's SABR-streaming gate. `web` is intentionally
-    # excluded — YouTube now strips HD URLs from the web client via SABR forcing
-    # (see yt-dlp issue #12482), so it falls all the way down to itag 18 (360p mp4).
-    # Other clients (`tv`, `mweb`, `tv_simply`, `ios` alone) cap at 360p without a
-    # per-client PO Token, so they're excluded too.
+    # `None` (yt-dlp defaults) is first because it's the only strategy that empirically
+    # works with the burner-account cookies in YOUTUBE_COOKIES: the desktop-Chrome
+    # cookies attached to non-web clients (`android_vr`, `web_safari`) trigger
+    # LOGIN_REQUIRED at YouTube's player-response stage, and forcing `web` triggers
+    # SABR streaming (yt-dlp #12482) which strips HD URLs and drops us to itag 18.
+    # The defaults path produces ~720p HLS combined — accepting that as the working
+    # quality ceiling until cookie scoping is split per-client.
     BOT_DETECTION_PATTERNS = ('Sign in to confirm', 'LOGIN_REQUIRED', 'HTTP Error 429')
     CLIENT_STRATEGIES = [
-        ['android_vr'],                     # Attempt 1: DASH up to 1080p, no SABR forcing
-        ['web_safari'],                     # Attempt 2: HLS up to 1080p (fallback)
-        None,                               # Attempt 3: yt-dlp defaults (last resort — may be 720p)
+        None,                               # Attempt 1: yt-dlp defaults + cookies → 720p HLS (works)
+        ['android_vr'],                     # Attempt 2: DASH 1080p path — only viable if cookies dropped
+        ['web_safari'],                     # Attempt 3: HLS 1080p path — same caveat
     ]
 
     info = None
