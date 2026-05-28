@@ -102,10 +102,12 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 # Expose FastAPI port
 EXPOSE 8000
 
-# Start the bgutil POT server (background, 127.0.0.1:4416), upgrade yt-dlp
-# at startup so it tracks YouTube API changes, then exec uvicorn.
-# yt-dlp's bgutil plugin auto-detects the local provider at 4416.
-# bgutil output is piped to the container's stdout (prefixed [bgutil]) so a
-# crash is visible in Railway runtime logs.
-# `exec` makes uvicorn PID 1 so SIGTERM still shuts the container down cleanly.
-CMD ["sh", "-c", "echo 'Node.js:' && node --version && echo 'Node.js (bgutil):' && node-bgutil --version && (cd /opt/bgutil && node-bgutil build/main.js --port 4416 2>&1 | sed -u 's/^/[bgutil] /' &) && pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Container start: launches the bgutil POT server in the background, waits
+# for /ping (or surfaces the crash log if it dies), upgrades yt-dlp, then
+# execs uvicorn. yt-dlp's bgutil plugin auto-detects 127.0.0.1:4416.
+# `exec` keeps uvicorn as PID 1 so SIGTERM still shuts the container down.
+# start.sh came in via `COPY . .` above; we already chowned /app to appuser.
+USER root
+RUN chmod +x /app/start.sh
+USER appuser
+CMD ["/app/start.sh"]
