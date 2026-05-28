@@ -20,8 +20,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg, OpenCV dependencies, Node.js + git (Node powers yt-dlp's
-# challenge solver and the bgutil POT HTTP server; git is needed to clone bgutil).
+# Install FFmpeg, OpenCV deps, Node.js + git (Node runs yt-dlp's challenge
+# solver and the bgutil POT HTTP server). The libcairo/pango/jpeg/gif/pixman
+# packages are runtime deps of the bgutil `canvas` Node module — without them
+# the POT server crashes on startup with "libcairo.so not found".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
@@ -33,6 +35,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     xz-utils \
     git \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libjpeg62-turbo \
+    libgif7 \
+    libpixman-1-0 \
+    librsvg2-2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js from official binary (nodesource scripts are unreliable)
@@ -52,7 +61,9 @@ RUN git clone --depth 1 --single-branch --branch ${BGUTIL_VERSION} \
        https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git ${BGUTIL_DIR} \
     && cd ${BGUTIL_DIR}/server \
     && npm ci --no-audit --no-fund \
-    && npx tsc
+    && npx tsc \
+    && test -f build/main.js \
+       || (echo "FATAL: bgutil build/main.js missing after tsc" >&2; ls -la build || true; exit 1)
 
 # Copy virtual env from builder and make writable for runtime upgrades
 COPY --from=builder /opt/venv /opt/venv
@@ -85,5 +96,7 @@ EXPOSE 8000
 # Start the bgutil POT server (background, 127.0.0.1:4416), upgrade yt-dlp
 # at startup so it tracks YouTube API changes, then exec uvicorn.
 # yt-dlp's bgutil plugin auto-detects the local provider at 4416.
+# bgutil output is piped to the container's stdout (prefixed [bgutil]) so a
+# crash is visible in Railway runtime logs.
 # `exec` makes uvicorn PID 1 so SIGTERM still shuts the container down cleanly.
-CMD ["sh", "-c", "echo 'Node.js:' && node --version && node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --port 4416 > /tmp/bgutil.log 2>&1 & pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "echo 'Node.js:' && node --version && (node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --port 4416 2>&1 | sed -u 's/^/[bgutil] /' &) && pip install --quiet --upgrade 'yt-dlp[default]' && exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
