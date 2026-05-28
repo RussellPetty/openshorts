@@ -580,14 +580,16 @@ def download_youtube_video(url, output_dir="."):
     }
     
     # Retry with escalating player client strategies to avoid bot detection.
-    # Only include clients that return HD formats without a PO Token — `tv`, `mweb`,
-    # `tv_simply`, and `ios` alone now strip everything above 360p (DRM + PO Token gates),
-    # so falling back to them silently produces blurry clips.
+    # `web` is forced first instead of yt-dlp defaults because the default mix includes
+    # `tv` variants that cap at 720p HLS — with cookies + bgutil POT the `web` client
+    # exposes the full DASH ladder (1080p+ video-only + m4a audio for clean merging).
+    # Other clients (`tv`, `mweb`, `tv_simply`, `ios` alone) strip everything above 360p
+    # without a per-client PO Token, so they're intentionally excluded.
     BOT_DETECTION_PATTERNS = ('Sign in to confirm', 'LOGIN_REQUIRED', 'HTTP Error 429')
     CLIENT_STRATEGIES = [
-        None,                               # Attempt 1: yt-dlp defaults
-        ['android_vr'],                     # Attempt 2: android_vr returns DASH up to 1080p
-        ['web_safari'],                     # Attempt 3: web_safari returns HLS up to 1080p
+        ['web'],                            # Attempt 1: web returns DASH up to 1080p+ (cookies + POT)
+        ['android_vr'],                     # Attempt 2: android_vr returns DASH up to 1080p (POT not needed)
+        ['web_safari'],                     # Attempt 3: web_safari returns HLS up to 1080p (last resort)
     ]
 
     info = None
