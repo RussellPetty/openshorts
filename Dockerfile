@@ -79,10 +79,17 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 # Create directories including Ultralytics cache config
 RUN mkdir -p /app/uploads /app/output /tmp/Ultralytics
 
+# Symlink bgutil into appuser's home so the Python plugin's default
+# script-mode lookup path (~/bgutil-ytdlp-pot-provider/server/build/generate_once.js)
+# resolves to our /opt install. Without this the plugin falls back silently
+# when the HTTP server probe fails.
+RUN ln -s /opt/bgutil-ytdlp-pot-provider /app/bgutil-ytdlp-pot-provider
+
 # Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache,
 # /opt/venv for runtime upgrades, /opt/bgutil-ytdlp-pot-provider so the
 # bgutil HTTP server can be started by appuser.
-RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/venv /opt/bgutil-ytdlp-pot-provider
+RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/venv /opt/bgutil-ytdlp-pot-provider \
+    && chown -h appuser:appuser /app/bgutil-ytdlp-pot-provider
 
 # Switch to non-root user
 USER appuser
