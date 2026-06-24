@@ -485,133 +485,104 @@ def _download_direct_url(url, output_dir="."):
     return output_path, sanitized
 
 
-def _download_via_ytdown(url, output_dir="."):
+def _download_via_savenow(url, output_dir="."):
     """
-    Reverse-engineered ytdown.to flow: their backend does the YouTube heavy lifting
-    (PO Tokens, IP rotation, format extraction), and we just consume a clean mp4.
+    Download a YouTube video through the video-download-api.com REST API
+    (savenow / loader-compatible). Their backend handles YouTube bot detection,
+    PO tokens, IP rotation, and format extraction; we submit a job, poll progress,
+    then fetch a clean merged mp4 — so Railway's datacenter IP is never the one
+    talking to YouTube. Requires the SAVENOW_API_KEY env var.
 
-      0) GET  app.ytdown.to/en28/                              → PHPSESSID cookie (warmup)
-      1) POST app.ytdown.to/proxy.php  body: url=<yt url>      → metadata + mediaItems
-      2) POST app.ytdown.to/proxy.php  body: url=<mediaUrl>    → status: queued|processing|completed
-      3) GET  fileUrl from completion                          → final mp4
-
-    The warmup GET + cookie jar + full Chrome `sec-ch-ua`/`sec-fetch-*` headers are
-    load-bearing: their Cloudflare layer and PHP backend both penalize cold raw POSTs
-    (observed: server-side cold requests get stuck at `queued 0%` indefinitely; the
-    same flow after a warmup GET enters `processing` on the first poll).
+      1) GET  p.savenow.to/ajax/download.php?url=<yt>&format=1080&apikey=<KEY>
+              &allow_extended_duration=1                  -> {success, id, progress_url, title}
+      2) poll progress_url (or /ajax/progress.php?id=<id>) -> until download_url present
+      3) GET  download_url                                 -> final mp4
 
     Raises on any failure so the caller can fall back to the local yt-dlp path.
     """
-    import http.cookiejar
     import json
 
-    YTDOWN = 'https://app.ytdown.to/proxy.php'
+    api_key = os.environ.get("SAVENOW_API_KEY")
+    if not api_key:
+        raise RuntimeError("SAVENOW_API_KEY not set")
+
+    api_host = os.environ.get("SAVENOW_API_HOST", "https://p.savenow.to").rstrip('/')
+    fmt = os.environ.get("SAVENOW_FORMAT", "1080")
     UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
           '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36')
-    COMMON_HEADERS = {
-        'User-Agent': UA,
-        'Accept-Language': 'en-US,en;q=0.9',
-        'sec-ch-ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-    }
-    POST_HEADERS = {
-        **COMMON_HEADERS,
-        'Accept': '*/*',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Origin': 'https://app.ytdown.to',
-        'Referer': 'https://app.ytdown.to/en28/',
-        'X-Requested-With': 'XMLHttpRequest',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'priority': 'u=1, i',
-    }
-    cookie_jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
 
-    def _post(body_url, timeout=20):
-        data = urllib.parse.urlencode({'url': body_url}).encode()
-        req = urllib.request.Request(YTDOWN, data=data, headers=POST_HEADERS, method='POST')
-        with opener.open(req, timeout=timeout) as resp:
+    def _get_json(u, timeout=30):
+        req = urllib.request.Request(u, headers={'User-Agent': UA, 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
 
     step_start_time = time.time()
-    print(f"📥 Trying ytdown.to fast path for {url}")
+    print(f"\U0001F4E5 Trying video-download-api (savenow) for {url}")
 
-    # 0) warmup GET — picks up PHPSESSID, mimics a real page-visit-then-XHR flow
-    warmup_req = urllib.request.Request('https://app.ytdown.to/en28/', headers={
-        **COMMON_HEADERS,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
+    # 1) submit the download job
+    submit_url = f"{api_host}/ajax/download.php?" + urllib.parse.urlencode({
+        'url': url,
+        'format': fmt,
+        'apikey': api_key,
+        'add_info': '1',
+        'allow_extended_duration': '1',
+        'no_merge': '0',
     })
-    with opener.open(warmup_req, timeout=15) as r:
-        r.read()
-    cookie_names = [c.name for c in cookie_jar]
-    print(f"   Warmup cookies: {cookie_names or '(none)'}")
+    meta = _get_json(submit_url)
+    if not meta.get('success') or not meta.get('id'):
+        raise RuntimeError(f"savenow submit failed: {str(meta)[:200]}")
 
-    # 1) metadata
-    meta = _post(url).get('api') or {}
-    if meta.get('status') != 'ok' or not meta.get('mediaItems'):
-        raise RuntimeError(f"ytdown metadata bad: status={meta.get('status')!r} items={len(meta.get('mediaItems') or [])}")
-
-    title = meta.get('title') or 'youtube_video'
+    job_id = meta['id']
+    progress_url = meta.get('progress_url') or (
+        f"{api_host}/ajax/progress.php?id={urllib.parse.quote(str(job_id))}")
+    title = meta.get('title') or (meta.get('info') or {}).get('title') or 'youtube_video'
     sanitized_title = sanitize_filename(title)
     output_template = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if os.path.exists(output_template):
         os.remove(output_template)
+    print(f"   job id={job_id} title={title!r}")
 
-    # Pick the highest-resolution mp4 video item (FHD > HD > SD).
-    _QUALITY_RANK = {'FHD': 4, 'HD': 3, 'SD': 2}
-    video_items = [
-        it for it in meta['mediaItems']
-        if it.get('type') == 'Video' and (it.get('mediaExtension') or '').upper() == 'MP4'
-    ]
-    if not video_items:
-        raise RuntimeError("ytdown returned no mp4 video items")
-    video_items.sort(key=lambda it: (
-        _QUALITY_RANK.get((it.get('mediaQuality') or '').upper(), 0),
-        int((it.get('mediaRes') or '0x0').split('x')[-1] or 0),
-    ), reverse=True)
-    best = video_items[0]
-    print(f"   Selected {best.get('mediaQuality')} ({best.get('mediaRes')}) — {best.get('mediaFileSize')}")
-
-    # 2) start render + poll
-    media_url = best['mediaUrl']
-    deadline = time.time() + 180  # 3-minute cap before we fall back
-    file_url = None
+    # 2) poll until the file is ready (their side does the heavy lifting; be patient
+    #    for long videos). download_url host varies per job (travisNN.savenow.to etc).
+    deadline = time.time() + 600
+    download_url = None
     poll = 0
     while time.time() < deadline:
         poll += 1
-        job = _post(media_url).get('api') or {}
-        status = job.get('status')
-        if status == 'completed':
-            file_url = job.get('fileUrl')
-            print(f"   Render completed after {poll} polls in {time.time() - step_start_time:.1f}s")
+        try:
+            job = _get_json(progress_url, timeout=30)
+        except Exception as e:
+            print(f"   savenow poll {poll} error: {e}")
+            time.sleep(3)
+            continue
+        candidate = job.get('download_url') or job.get('url')
+        if candidate and str(candidate).startswith(('http://', 'https://')):
+            download_url = candidate
+            print(f"   savenow render completed after {poll} polls in {time.time() - step_start_time:.1f}s")
             break
-        if status not in ('queued', 'processing'):
-            raise RuntimeError(f"ytdown unexpected job status: {status!r} (poll {poll})")
-        time.sleep(2)
+        if poll % 5 == 1:
+            print(f"   savenow progress={job.get('progress')} {job.get('text')}")
+        time.sleep(3)
     else:
-        raise RuntimeError(f"ytdown render did not complete within 180s ({poll} polls)")
+        raise RuntimeError(f"savenow did not complete within 600s ({poll} polls)")
 
-    if not file_url or not file_url.startswith(('http://', 'https://')):
-        raise RuntimeError(f"ytdown completion missing fileUrl: {file_url!r}")
+    if not download_url:
+        raise RuntimeError("savenow completion missing download_url")
 
     # 3) download the merged mp4
-    file_req = urllib.request.Request(file_url, headers={'User-Agent': UA})
-    with opener.open(file_req, timeout=300) as resp, open(output_template, 'wb') as f:
+    file_req = urllib.request.Request(download_url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(file_req, timeout=600) as resp, open(output_template, 'wb') as f:
         while True:
             chunk = resp.read(1024 * 1024)  # 1 MB
             if not chunk:
                 break
             f.write(chunk)
 
+    if not os.path.exists(output_template) or os.path.getsize(output_template) < 100 * 1024:
+        raise RuntimeError(f"savenow downloaded file missing/too small: {output_template}")
+
     elapsed = time.time() - step_start_time
-    print(f"✅ ytdown.to fast path done in {elapsed:.2f}s: {output_template}")
+    print(f"\u2705 savenow done in {elapsed:.2f}s: {output_template}")
     return output_template, sanitized_title
 
 
@@ -619,19 +590,19 @@ def download_youtube_video(url, output_dir="."):
     """
     Downloads a YouTube video.
 
-    Tries the ytdown.to fast path first (their backend handles YouTube bot detection,
-    PO Tokens, and format extraction; we just consume a clean mp4). If that fails for
-    any reason — service down, rate-limit, video they can't process — falls back to
-    the local yt-dlp + bgutil POT pipeline.
+    Tries the video-download-api (savenow) fast path first (their backend handles
+    YouTube bot detection, PO tokens, and format extraction; we just consume a clean
+    mp4). If that fails for any reason — service down, no API key, video they can't
+    process — falls back to the local yt-dlp + bgutil POT pipeline.
     """
     # Bypass everything for non-YouTube direct URLs (Supabase, S3, etc.)
     if not _is_youtube_url(url):
         return _download_direct_url(url, output_dir)
 
     try:
-        return _download_via_ytdown(url, output_dir)
+        return _download_via_savenow(url, output_dir)
     except Exception as e:
-        print(f"⚠️  ytdown.to fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
+        print(f"⚠️  savenow fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
 
