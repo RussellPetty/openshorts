@@ -49,7 +49,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     librsvg2-2 \
     # --- CloakBrowser: virtual display + stealth-Chromium runtime libraries ---
     xvfb \
+    # Font set matching CloakBrowser's own reference image, so its Windows spoof
+    # has coherent font enumeration (weak fonts make Cloudflare escalate the challenge).
     fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-unifont \
+    fonts-freefont-ttf \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-tlwg-loma-otf \
+    libfontconfig1 \
+    libgdk-pixbuf-2.0-0 \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \

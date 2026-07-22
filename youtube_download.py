@@ -94,6 +94,24 @@ def _wait_past_cloudflare(page, timeout=45):
         time.sleep(1.5)
 
 
+def _snapshot(page):
+    """Best-effort page state for diagnosing why savefrom stalled (CF challenge vs. flow)."""
+    def _safe(fn, default=''):
+        try:
+            return fn()
+        except Exception:
+            return default
+    title = _safe(lambda: page.title())
+    url = _safe(lambda: page.url)
+    cf_iframes = _safe(lambda: len(page.query_selector_all('iframe[src*="challenges.cloudflare.com"]')), 0)
+    captcha_visible = _safe(lambda: page.is_visible('#captchaContainer'), False)
+    err = (_safe(lambda: (page.inner_text('#error-text') or '').strip())
+           or _safe(lambda: (page.inner_text('#error') or '').strip()))
+    body = _safe(lambda: ' '.join((page.inner_text('body') or '').split())[:200])
+    return (f"title={title!r} url={url} cf_challenge_iframes={cf_iframes} "
+            f"captchaVisible={captcha_visible} errorText={err!r} body[:200]={body!r}")
+
+
 def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
     """
     Drive savefrom.space in CloakBrowser to obtain a direct download URL, then fetch it.
@@ -130,6 +148,16 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
     try:
         page = browser.new_page()
         captured = {}
+        seen = {'getdata_req': False, 'getconvert_req': False}
+
+        def _on_request(req):
+            try:
+                if req.url.endswith('/getdata'):
+                    seen['getdata_req'] = True
+                elif req.url.endswith('/getconvert'):
+                    seen['getconvert_req'] = True
+            except Exception:
+                pass
 
         def _on_response(resp):
             try:
@@ -141,17 +169,35 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
             except Exception:
                 pass
 
+        page.on('request', _on_request)
         page.on('response', _on_response)
 
         page.goto(SAVEFROM_URL, wait_until='domcontentloaded', timeout=60000)
         _wait_past_cloudflare(page)
+        try:
+            print(f"   page loaded: title={page.title()!r} url={page.url}")
+        except Exception:
+            pass
 
         # Submit the URL — this executes the (managed, invisible) Turnstile and fires /getdata.
         page.wait_for_selector('#url', timeout=30000)
         page.fill('#url', url)
         page.click('#submit-btn')
 
-        meta = _wait_for(lambda: captured.get('getdata'), timeout=timeout, label='savefrom /getdata')
+        # Wait for the Turnstile-gated /getdata response. On timeout, snapshot the page so
+        # the logs tell us WHERE it stuck (Cloudflare challenge vs. flow bug) — not just "timeout".
+        meta = None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            meta = captured.get('getdata')
+            if meta is not None:
+                break
+            time.sleep(1)
+        if meta is None:
+            raise RuntimeError(
+                f"savefrom /getdata timed out after {timeout}s "
+                f"(getdata_requested={seen['getdata_req']}) — {_snapshot(page)}"
+            )
         if meta.get('error'):
             raise RuntimeError(f"savefrom getdata error: {meta.get('message')}")
         data = meta.get('data') or {}
