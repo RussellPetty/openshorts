@@ -179,9 +179,30 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
         except Exception:
             pass
 
-        # Submit the URL — this executes the (managed, invisible) Turnstile and fires /getdata.
+        # Enter the URL like a human. page.fill() alone left savefrom's validator seeing an
+        # empty field ("Please paste a valid YouTube URL", getdata never fired), so we type
+        # real keystrokes AND set value + dispatch the events its JS listens on, then wait
+        # a beat before submitting so validation passes.
         page.wait_for_selector('#url', timeout=30000)
-        page.fill('#url', url)
+        box = page.locator('#url')
+        box.click()
+        box.fill('')
+        try:
+            box.press_sequentially(url, delay=60)
+        except Exception:
+            page.type('#url', url, delay=60)
+        page.evaluate(
+            """(v) => {
+                const el = document.querySelector('#url');
+                if (el) {
+                    el.value = v;
+                    for (const t of ['input', 'change', 'keyup', 'blur'])
+                        el.dispatchEvent(new Event(t, { bubbles: true }));
+                }
+            }""",
+            url,
+        )
+        time.sleep(1.0)
         page.click('#submit-btn')
 
         # Wait for the Turnstile-gated /getdata response. On timeout, snapshot the page so
@@ -259,3 +280,80 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
     _download_file(download_url, output_path)
     print(f"✅ savefrom+CloakBrowser done in {time.time() - step_start:.1f}s: {output_path}")
     return output_path, title
+
+
+def download_via_savenow(url, output_dir='.', want='video'):
+    """
+    Download via the savenow / video-download-api REST API. Their backend talks to
+    YouTube, so Railway's IP never does. Requires SAVENOW_API_KEY. Returns (path, title);
+    raises on any failure so the chain can move on to the next service.
+    """
+    import json
+    api_key = os.environ.get('SAVENOW_API_KEY')
+    if not api_key:
+        raise RuntimeError('SAVENOW_API_KEY not set')
+    host = os.environ.get('SAVENOW_API_HOST', 'https://p.savenow.to').rstrip('/')
+    fmt = os.environ.get('SAVENOW_FORMAT', '1080')
+
+    def _get_json(u, timeout=30):
+        req = urllib.request.Request(u, headers={'User-Agent': CHROME_UA, 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    start = time.time()
+    print(f"📥 savenow (fmt={fmt}) for {url}")
+    submit = f"{host}/ajax/download.php?" + urllib.parse.urlencode({
+        'url': url, 'format': fmt, 'apikey': api_key,
+        'add_info': '1', 'allow_extended_duration': '1', 'no_merge': '0'})
+    meta = _get_json(submit)
+    if not meta.get('success') or not meta.get('id'):
+        raise RuntimeError(f"savenow submit failed: {str(meta)[:200]}")
+    title = sanitize_filename(meta.get('title') or (meta.get('info') or {}).get('title') or 'youtube_video')
+    prog = meta.get('progress_url') or f"{host}/ajax/progress.php?id={urllib.parse.quote(str(meta['id']))}"
+
+    download_url = None
+    deadline = time.time() + 600
+    poll = 0
+    while time.time() < deadline:
+        poll += 1
+        try:
+            job = _get_json(prog, timeout=30)
+        except Exception as e:
+            print(f"   savenow poll {poll} err: {str(e)[:100]}")
+            time.sleep(3)
+            continue
+        cand = job.get('download_url') or job.get('url')
+        if cand and str(cand).startswith(('http://', 'https://')):
+            download_url = cand
+            print(f"   savenow ready after {poll} polls in {time.time() - start:.1f}s")
+            break
+        if poll % 5 == 1:
+            print(f"   savenow progress={job.get('progress')} {job.get('text')}")
+        time.sleep(3)
+    if not download_url:
+        raise RuntimeError('savenow did not complete within 600s')
+
+    output_path = os.path.join(output_dir, f'{title}.mp4')
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    _download_file(download_url, output_path)
+    print(f"✅ savenow done in {time.time() - start:.1f}s: {output_path}")
+    return output_path, title
+
+
+def download_youtube(url, output_dir='.', want='video'):
+    """
+    Shared YouTube download chain for /api/transcribe and the clip pipeline.
+    Order: savenow (clean REST API, 1080p) -> savefrom via CloakBrowser (stealth browser,
+    passes Cloudflare). NO yt-dlp — YouTube blocks Railway's datacenter IP for it.
+    Returns (path, title); raises RuntimeError only if EVERY service fails.
+    """
+    errors = []
+    for name, fn in (('savenow', download_via_savenow), ('savefrom', download_via_savefrom)):
+        try:
+            return fn(url, output_dir, want=want)
+        except Exception as e:
+            msg = f"{name}: {type(e).__name__}: {e}"
+            print(f"⚠️  {msg}")
+            errors.append(msg)
+    raise RuntimeError("all download services failed -> " + " | ".join(errors))

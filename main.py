@@ -599,11 +599,11 @@ def download_youtube_video(url, output_dir="."):
     if not _is_youtube_url(url):
         return _download_direct_url(url, output_dir)
 
-    try:
-        import youtube_download
-        return youtube_download.download_via_savefrom(url, output_dir, want='video')
-    except Exception as e:
-        print(f"⚠️  savefrom/CloakBrowser fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
+    # Shared service chain: savenow (1080p REST API) -> savefrom via CloakBrowser. No yt-dlp
+    # (YouTube blocks Railway's datacenter IP for it). The legacy yt-dlp block below this
+    # return is now unreachable; kept temporarily to avoid a risky mass-delete.
+    import youtube_download
+    return youtube_download.download_youtube(url, output_dir, want='video')
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
 

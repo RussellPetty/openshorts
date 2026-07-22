@@ -719,7 +719,7 @@ class TranscribeResponse(BaseModel):
     duration_seconds: float
 
 def _download_video(url: str, output_dir: str) -> str:
-    """Download video via yt-dlp (works for YouTube and direct URLs)."""
+    """Download a video URL. YouTube -> savenow/savefrom service chain; other URLs direct."""
     import urllib.parse
     parsed = urllib.parse.urlparse(url)
     hostname = (parsed.hostname or '').lower()
@@ -733,33 +733,11 @@ def _download_video(url: str, output_dir: str) -> str:
         urllib.request.urlretrieve(url, out)
         return out
 
-    # YouTube: try savefrom (driven by CloakBrowser) FIRST. Bare yt-dlp fails on
-    # Railway's datacenter IP (YouTube 429 / "confirm you're not a bot"); savefrom's
-    # backend does the YouTube extraction for us, and CloakBrowser gets us past the
-    # Cloudflare Turnstile guarding it. yt-dlp remains the last-resort fallback.
-    try:
-        path, _title = youtube_download.download_via_savefrom(url, output_dir, want='video')
-        return path
-    except Exception as e:
-        print(f"⚠️  savefrom/CloakBrowser failed ({type(e).__name__}: {e}); falling back to yt-dlp")
-
-    # yt-dlp fallback (extract audio to wav for Whisper). Honors an optional residential
-    # proxy via YTDLP_PROXY — the reliable cure for the datacenter-IP block if needed.
-    output_template = os.path.join(output_dir, "video.%(ext)s")
-    cmd = ["yt-dlp", "-x", "--audio-format", "wav", "-o", output_template, "--no-playlist"]
-    proxy = os.environ.get("YTDLP_PROXY")
-    if proxy:
-        cmd += ["--proxy", proxy]
-    cmd.append(url)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {result.stderr}")
-
-    # Find downloaded file
-    for f in os.listdir(output_dir):
-        if f.startswith("video"):
-            return os.path.join(output_dir, f)
-    raise RuntimeError("yt-dlp produced no output file")
+    # YouTube: use the shared service chain — savenow (1080p REST API) -> savefrom driven
+    # by CloakBrowser (stealth browser that clears Cloudflare from Railway's IP). No yt-dlp:
+    # YouTube hard-blocks Railway's datacenter IP (HTTP 429 / "confirm you're not a bot").
+    path, _title = youtube_download.download_youtube(url, output_dir, want='video')
+    return path
 
 
 def _transcribe(video_path: str) -> dict:
