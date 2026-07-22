@@ -312,8 +312,10 @@ def download_via_savenow(url, output_dir='.', want='video'):
     prog = meta.get('progress_url') or f"{host}/ajax/progress.php?id={urllib.parse.quote(str(meta['id']))}"
 
     download_url = None
-    deadline = time.time() + 600
+    deadline = time.time() + 240
     poll = 0
+    ERROR_HINTS = ('not supported', 'not available', 'unavailable', 'error', 'failed',
+                   'private', 'removed', 'copyright', 'no video', 'invalid')
     while time.time() < deadline:
         poll += 1
         try:
@@ -327,11 +329,16 @@ def download_via_savenow(url, output_dir='.', want='video'):
             download_url = cand
             print(f"   savenow ready after {poll} polls in {time.time() - start:.1f}s")
             break
+        # Fail fast on savenow's error states (e.g. progress=1000 "Live streams are not
+        # supported") so the chain falls back to savefrom immediately, not after 240s.
+        text = str(job.get('text') or '')
+        if str(job.get('progress')) == '1000' or any(k in text.lower() for k in ERROR_HINTS):
+            raise RuntimeError(f"savenow cannot handle this video: {text[:120]}")
         if poll % 5 == 1:
             print(f"   savenow progress={job.get('progress')} {job.get('text')}")
         time.sleep(3)
     if not download_url:
-        raise RuntimeError('savenow did not complete within 600s')
+        raise RuntimeError('savenow did not complete within 240s')
 
     output_path = os.path.join(output_dir, f'{title}.mp4')
     if os.path.exists(output_path):
