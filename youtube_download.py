@@ -75,8 +75,9 @@ def is_youtube_url(url):
     return any(h in hostname for h in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
 
 
-def _download_file(download_url, output_path, timeout=600):
-    """Stream a direct download URL to disk in 1 MB chunks; sanity-check the size."""
+def _download_file(download_url, output_path, timeout=600, min_bytes=100 * 1024):
+    """Stream a direct download URL to disk in 1 MB chunks with a browser User-Agent
+    (many hosts 403 the default Python-urllib UA); sanity-check the size."""
     req = urllib.request.Request(download_url, headers={'User-Agent': CHROME_UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(output_path, 'wb') as f:
         while True:
@@ -85,7 +86,7 @@ def _download_file(download_url, output_path, timeout=600):
                 break
             f.write(chunk)
     size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-    if size < 100 * 1024:  # <100 KB means we saved an error page, not a video
+    if size < min_bytes:  # too small means we saved an error page, not media
         raise RuntimeError(f"downloaded file too small ({size} bytes): {output_path}")
     return output_path
 

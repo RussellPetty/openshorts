@@ -726,11 +726,12 @@ def _download_video(url: str, output_dir: str) -> str:
     is_youtube = any(h in hostname for h in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
 
     if not is_youtube:
-        # Direct URL download
-        import urllib.request
-        ext = os.path.splitext(parsed.path)[1] or '.mp4'
+        # Direct URL (S3, Supabase, audio CDN, etc.). Fetch with a browser User-Agent —
+        # many hosts (e.g. the audio CDNs) 403 the default Python-urllib UA. Extension is
+        # irrelevant: faster-whisper decodes by content, so an m4a transcribes either way.
+        ext = os.path.splitext(parsed.path)[1] or '.m4a'
         out = os.path.join(output_dir, f"video{ext}")
-        urllib.request.urlretrieve(url, out)
+        youtube_download._download_file(url, out, min_bytes=2048)
         return out
 
     # YouTube: use the shared service chain — savenow (1080p REST API) -> savefrom driven
