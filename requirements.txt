@@ -7,6 +7,9 @@ torchvision
 tqdm
 yt-dlp[default]
 yt-dlp-ejs
+# CloakBrowser: stealth Chromium used to pass the Cloudflare Turnstile guarding
+# savefrom.space (our pre-yt-dlp fallback). Pulls in Playwright as a dependency.
+cloakbrowser
 bgutil-ytdlp-pot-provider==1.3.1
 faster-whisper
 google-genai

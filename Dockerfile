@@ -47,6 +47,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgif7 \
     libpixman-1-0 \
     librsvg2-2 \
+    # --- CloakBrowser: virtual display + stealth-Chromium runtime libraries ---
+    xvfb \
+    fonts-liberation \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libatspi2.0-0 \
+    libx11-6 \
+    libxcb1 \
+    libxi6 \
+    libxtst6 \
+    libxcursor1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js from official binary (nodesource scripts are unreliable)
@@ -98,6 +120,13 @@ USER appuser
 
 # Pre-download YOLO model on build (now running as appuser)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+# Pre-download the CloakBrowser stealth Chromium (~200MB) at build time so the
+# first /api/transcribe request doesn't stall on it — and a runtime network blip
+# can't break the download path. Cached under appuser's writable /app home.
+ENV CLOAKBROWSER_CACHE_DIR=/app/.cloakbrowser
+RUN python -m cloakbrowser install \
+    || echo "[build] cloakbrowser install failed; will lazy-download at runtime"
 
 # Expose FastAPI port
 EXPOSE 8000

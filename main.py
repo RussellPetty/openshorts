@@ -600,9 +600,10 @@ def download_youtube_video(url, output_dir="."):
         return _download_direct_url(url, output_dir)
 
     try:
-        return _download_via_savenow(url, output_dir)
+        import youtube_download
+        return youtube_download.download_via_savefrom(url, output_dir, want='video')
     except Exception as e:
-        print(f"⚠️  savenow fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
+        print(f"⚠️  savefrom/CloakBrowser fast path failed ({type(e).__name__}: {e}); falling back to local yt-dlp")
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
 
@@ -684,6 +685,7 @@ def download_youtube_video(url, output_dir="."):
         'retries': 10,
         'nocheckcertificate': True,
         'force_ipv4': True,
+        'proxy': os.environ.get('YTDLP_PROXY') or None,
         'cachedir': False,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'js_runtimes': {'node': {}},
@@ -784,6 +786,7 @@ Technical Details: {str(e)}
         'no_warnings': False,
         'overwrites': True,
         'cookiefile': cookies_path if cookies_path else None,
+        'proxy': os.environ.get('YTDLP_PROXY') or None,
         'js_runtimes': {'node': {}},
         'socket_timeout': 300,
         'retries': 5,

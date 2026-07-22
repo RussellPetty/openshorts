@@ -26,6 +26,7 @@ from models import (
 import editor
 import subtitles
 import cleaner
+import youtube_download
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -732,12 +733,24 @@ def _download_video(url: str, output_dir: str) -> str:
         urllib.request.urlretrieve(url, out)
         return out
 
-    # YouTube download via yt-dlp
+    # YouTube: try savefrom (driven by CloakBrowser) FIRST. Bare yt-dlp fails on
+    # Railway's datacenter IP (YouTube 429 / "confirm you're not a bot"); savefrom's
+    # backend does the YouTube extraction for us, and CloakBrowser gets us past the
+    # Cloudflare Turnstile guarding it. yt-dlp remains the last-resort fallback.
+    try:
+        path, _title = youtube_download.download_via_savefrom(url, output_dir, want='video')
+        return path
+    except Exception as e:
+        print(f"⚠️  savefrom/CloakBrowser failed ({type(e).__name__}: {e}); falling back to yt-dlp")
+
+    # yt-dlp fallback (extract audio to wav for Whisper). Honors an optional residential
+    # proxy via YTDLP_PROXY — the reliable cure for the datacenter-IP block if needed.
     output_template = os.path.join(output_dir, "video.%(ext)s")
-    cmd = [
-        "yt-dlp", "-x", "--audio-format", "wav",
-        "-o", output_template, "--no-playlist", url,
-    ]
+    cmd = ["yt-dlp", "-x", "--audio-format", "wav", "-o", output_template, "--no-playlist"]
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        cmd += ["--proxy", proxy]
+    cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed: {result.stderr}")

@@ -37,4 +37,15 @@ done
 cd /app
 pip install --quiet --upgrade 'yt-dlp[default]' || echo "[startup] yt-dlp upgrade failed (continuing)"
 
+# Start a virtual display so CloakBrowser can run headed (headless=False), which
+# Cloudflare Turnstile requires. The app reads DISPLAY when it launches the browser.
+if command -v Xvfb >/dev/null 2>&1; then
+  echo "Starting Xvfb virtual display on :99..."
+  Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > /tmp/xvfb.log 2>&1 &
+  export DISPLAY=:99
+  sleep 1
+else
+  echo "[startup] Xvfb not found — CloakBrowser headed mode unavailable, savefrom will be skipped"
+fi
+
 exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8000}"
