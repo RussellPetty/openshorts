@@ -31,6 +31,35 @@ CHROME_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 
 SAVEFROM_URL = 'https://savefrom.space/'
 
+# savefrom.space monetizes with popunder + overlay ads. Block these networks and
+# auto-close any ad popup/tab so they can't hijack or cover the download flow.
+_AD_HOST_HINTS = (
+    'googlesyndication', 'doubleclick', 'adservice', 'adexchang', 'adnxs',
+    'popads', 'popcash', 'propellerads', 'propeller', 'adsterra', 'hilltopads',
+    'clickadu', 'taboola', 'outbrain', 'usrpubtrk', 'acscdn', 'aclib',
+    'poperblock', 'pushnotif', 'mgid', 'adcash', 'onclickalgo',
+)
+
+
+def _safe_close(pg):
+    try:
+        pg.close()
+    except Exception:
+        pass
+
+
+def _ad_router(route):
+    try:
+        if any(h in route.request.url.lower() for h in _AD_HOST_HINTS):
+            route.abort()
+            return
+    except Exception:
+        pass
+    try:
+        route.continue_()
+    except Exception:
+        pass
+
 
 def sanitize_filename(filename):
     """Remove invalid characters from filename (mirrors main.py.sanitize_filename)."""
@@ -172,6 +201,11 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
         page.on('request', _on_request)
         page.on('response', _on_response)
 
+        # Neutralize savefrom's ads: block ad networks, auto-close popunders/extra tabs.
+        page.route('**/*', _ad_router)
+        page.on('popup', _safe_close)
+        page.context.on('page', lambda p: None if p is page else _safe_close(p))
+
         page.goto(SAVEFROM_URL, wait_until='domcontentloaded', timeout=60000)
         _wait_past_cloudflare(page)
         try:
@@ -203,70 +237,88 @@ def download_via_savefrom(url, output_dir='.', want='video', timeout=120):
             url,
         )
         time.sleep(1.0)
-        page.click('#submit-btn')
 
-        # Wait for the Turnstile-gated /getdata response. On timeout, snapshot the page so
-        # the logs tell us WHERE it stuck (Cloudflare challenge vs. flow bug) — not just "timeout".
+        # Submit and wait for the Turnstile-gated /getdata to fire. The first click is often
+        # swallowed by an ad popunder, so re-click every ~10s until getdata is actually requested.
         meta = None
         deadline = time.time() + timeout
+        clicks = 0
+        last_click = 0.0
         while time.time() < deadline:
             meta = captured.get('getdata')
             if meta is not None:
                 break
-            time.sleep(1)
+            now = time.time()
+            if not seen['getdata_req'] and (now - last_click) > 10 and clicks < 6:
+                try:
+                    page.click('#submit-btn', timeout=5000)
+                    clicks += 1
+                    print(f"   submit click #{clicks}")
+                except Exception as e:
+                    print(f"   submit click err: {str(e)[:80]}")
+                last_click = now
+            time.sleep(1.5)
         if meta is None:
+            try:
+                page.screenshot(path='/tmp/savefrom_fail.png')
+            except Exception:
+                pass
             raise RuntimeError(
                 f"savefrom /getdata timed out after {timeout}s "
-                f"(getdata_requested={seen['getdata_req']}) — {_snapshot(page)}"
+                f"(getdata_requested={seen['getdata_req']}, submit_clicks={clicks}) — {_snapshot(page)}"
             )
         if meta.get('error'):
             raise RuntimeError(f"savefrom getdata error: {meta.get('message')}")
         data = meta.get('data') or {}
-        vid_id = data.get('id')
-        if not vid_id:
-            raise RuntimeError(f"savefrom getdata missing id: {str(meta)[:200]}")
         title = sanitize_filename(data.get('title') or 'youtube_video')
         print(f"   getdata ok: {data.get('title')!r} "
               f"({data.get('duration')}, {data.get('filesize')})")
 
-        # Read Laravel's CSRF token so we can drive /getconvert directly (no fragile UI clicks).
-        csrf = page.evaluate(
-            "() => { const m = document.querySelector('meta[name=csrf-token]');"
-            " return m ? m.content : null; }"
-        )
+        # Click the "Convert <fmt>" link in the result card. That's what fires /getconvert with
+        # the correct per-format id — the DOM link is <a onclick="handleDownload(this,'<id>',
+        # '<fmt>')">. (Calling /getconvert via fetch with getdata's id doesn't match every video,
+        # e.g. livestream VODs.) We capture the /getconvert response for the direct download URL
+        # and re-click through ad popunders.
+        fmt_sel = "a[onclick*=\"'%s'\"]" % fmt
+        try:
+            page.wait_for_selector(fmt_sel, timeout=30000)
+        except Exception:
+            fmt_sel = "a[onclick*='handleDownload']"
+            page.wait_for_selector(fmt_sel, timeout=15000)
 
-        # Resolve a direct download URL; savefrom may report progress<100 and need re-polling.
         download_url = None
         deadline = time.time() + timeout
+        clicks = 0
+        last_click = 0.0
         while time.time() < deadline:
-            conv = page.evaluate(
-                """async ({ id, fmt, csrf }) => {
-                    const r = await fetch('/getconvert', {
-                        method: 'POST',
-                        headers: {
-                            'content-type': 'application/json',
-                            'accept': '*/*',
-                            'x-csrf-token': csrf || '',
-                        },
-                        body: JSON.stringify({ id, format: fmt }),
-                    });
-                    try { return await r.json(); }
-                    catch (e) { return { error: true, message: 'bad json (http ' + r.status + ')' }; }
-                }""",
-                {'id': vid_id, 'fmt': fmt, 'csrf': csrf},
-            )
+            conv = captured.get('getconvert')
             if conv and not conv.get('error'):
                 cand = conv.get('download') or conv.get('url')
                 if cand and str(cand).startswith(('http://', 'https://')):
                     download_url = cand
                     break
-                print(f"   getconvert progress={conv.get('progress')} status={conv.get('status')}")
-            else:
-                print(f"   getconvert error: {(conv or {}).get('message')}")
-            time.sleep(3)
+                if conv.get('progress') is not None:
+                    print(f"   getconvert progress={conv.get('progress')} status={conv.get('status')}")
+            now = time.time()
+            if download_url is None and (now - last_click) > 12 and clicks < 6:
+                try:
+                    page.locator(fmt_sel).first.click(timeout=5000)
+                    clicks += 1
+                    print(f"   convert click #{clicks}")
+                except Exception as e:
+                    print(f"   convert click err: {str(e)[:80]}")
+                last_click = now
+            time.sleep(1.5)
 
         if not download_url:
-            raise RuntimeError("savefrom getconvert never returned a download URL")
+            try:
+                page.screenshot(path='/tmp/savefrom_fail.png')
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"savefrom getconvert never returned a download URL "
+                f"(getconvert_requested={seen['getconvert_req']}, convert_clicks={clicks}) — {_snapshot(page)}"
+            )
     finally:
         try:
             browser.close()
