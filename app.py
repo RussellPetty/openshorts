@@ -27,6 +27,7 @@ import editor
 import subtitles
 import cleaner
 import youtube_download
+from url_utils import build_video_url
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -140,7 +141,7 @@ async def run_job_v2_wrapper(job_id: str):
 def parse_progress(log_line: str) -> Optional[Tuple[int, str]]:
     """Parse progress from log line. Returns (percentage, stage) or None."""
     line_lower = log_line.lower()
-    if "downloading" in line_lower:
+    if "downloading" in line_lower or "savenow" in line_lower or "savefrom" in line_lower:
         return (10, "Downloading video")
     if "transcribing" in line_lower:
         return (30, "Transcribing audio")
@@ -201,7 +202,7 @@ async def check_partial_results_v2(job_id: str, output_dir: str, store: RedisJob
             clip_path = os.path.join(output_dir, clip_filename)
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
                 ready_clips.append(ClipResult(
-                    video_url=f"/videos/{job_id}/{clip_filename}",
+                    video_url=build_video_url(job_id, clip_filename),
                     title=clip.get('video_title_for_youtube_short'),
                     description_tiktok=clip.get('video_description_for_tiktok'),
                     description_instagram=clip.get('video_description_for_instagram'),
@@ -229,7 +230,7 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
         for i, clip in enumerate(clips):
             clip_filename = f"{base_name}_clip_{i+1}.mp4"
             result_clips.append(ClipResult(
-                video_url=f"/videos/{job_id}/{clip_filename}",
+                video_url=build_video_url(job_id, clip_filename),
                 title=clip.get('video_title_for_youtube_short'),
                 description_tiktok=clip.get('video_description_for_tiktok'),
                 description_instagram=clip.get('video_description_for_instagram'),
@@ -239,6 +240,7 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
         # Store transcript for editor/subtitle features
         transcript = data.get('transcript')
         await store.set_result(job_id, JobResult(clips=result_clips, transcript=transcript))
+        await store.update_progress(job_id, 100, "Completed")
         await store.set_status(job_id, JobStatus.COMPLETED)
     else:
         await store.set_status(job_id, JobStatus.FAILED, "No metadata file generated")
@@ -247,6 +249,7 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
 async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
     """Execute v2 job with Redis progress tracking."""
     await store.set_status(job_id, JobStatus.PROCESSING)
+    await store.update_progress(job_id, 5, "Starting download")
     await store.append_log(job_id, "Job started by worker.")
 
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)

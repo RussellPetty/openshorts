@@ -78,11 +78,15 @@ class RedisJobStore:
         percentage: int,
         stage: Optional[str] = None
     ) -> None:
-        """Update job progress."""
-        updates: dict[str, Any] = {"progress_percentage": percentage}
+        """Update job progress without allowing late log lines to move it backward."""
+        job = await self.get_job(job_id)
+        if not job or percentage < job.progress_percentage:
+            return
+
+        job.progress_percentage = percentage
         if stage:
-            updates["progress_stage"] = stage
-        await self.update_job(job_id, **updates)
+            job.progress_stage = stage
+        await self.create_job(job)
 
     async def set_result(self, job_id: str, result: JobResult) -> None:
         """Set the job result."""
