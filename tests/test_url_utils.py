@@ -1,6 +1,6 @@
 import unittest
 
-from url_utils import build_video_url
+from url_utils import build_video_url, video_filename_from_url
 
 
 class BuildVideoUrlTests(unittest.TestCase):
@@ -20,6 +20,16 @@ class BuildVideoUrlTests(unittest.TestCase):
             build_video_url("job/with/slashes", "clip.mp4"),
             "/videos/job%2Fwith%2Fslashes/clip.mp4",
         )
+
+    def test_recovers_encoded_filename_for_disk_access(self):
+        self.assertEqual(
+            video_filename_from_url('/videos/job/Episode%20%232_clip_1.mp4'),
+            'Episode #2_clip_1.mp4',
+        )
+
+    def test_rejects_encoded_path_traversal(self):
+        with self.assertRaises(ValueError):
+            video_filename_from_url('/videos/job/..%2Fsecret.mp4')
 
 
 if __name__ == "__main__":

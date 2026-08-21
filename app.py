@@ -27,7 +27,7 @@ import editor
 import subtitles
 import cleaner
 import youtube_download
-from url_utils import build_video_url
+from url_utils import build_video_url, video_filename_from_url
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -435,8 +435,9 @@ async def edit_clip_v2(req: EditRequest):
     except IndexError:
         raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
 
-    filename = clip.video_url.split('/')[-1]
-    input_path = os.path.join(OUTPUT_DIR, req.job_id, req.input_filename or filename)
+    filename = video_filename_from_url(clip.video_url)
+    requested_filename = video_filename_from_url(req.input_filename) if req.input_filename else filename
+    input_path = os.path.join(OUTPUT_DIR, req.job_id, requested_filename)
 
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail="Video file not found")
@@ -449,7 +450,7 @@ async def edit_clip_v2(req: EditRequest):
         await loop.run_in_executor(None, lambda: cleaner.clean_clip(input_path, output_path))
 
         edited_filename = os.path.basename(output_path)
-        new_url = f"/videos/{req.job_id}/{edited_filename}"
+        new_url = build_video_url(req.job_id, edited_filename)
 
         return {"success": True, "edited_video_url": new_url}
 
@@ -475,7 +476,7 @@ async def clean_clip_v2(req: CleanRequest):
     except IndexError:
         raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
 
-    filename = clip.video_url.split('/')[-1]
+    filename = video_filename_from_url(clip.video_url)
     input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail="Video file not found on disk")
@@ -491,7 +492,7 @@ async def clean_clip_v2(req: CleanRequest):
         )
 
         cleaned_filename = os.path.basename(output_path)
-        new_url = f"/videos/{req.job_id}/{cleaned_filename}"
+        new_url = build_video_url(req.job_id, cleaned_filename)
         return {"success": True, "cleaned_video_url": new_url}
 
     except Exception as e:
@@ -518,8 +519,9 @@ async def add_subtitles_v2(req: SubtitleRequest):
         raise HTTPException(status_code=404, detail=f"Clip index {req.clip_index} not found")
 
     # Get video file path
-    filename = clip.video_url.split('/')[-1]
-    input_path = os.path.join(OUTPUT_DIR, req.job_id, req.input_filename or filename)
+    filename = video_filename_from_url(clip.video_url)
+    requested_filename = video_filename_from_url(req.input_filename) if req.input_filename else filename
+    input_path = os.path.join(OUTPUT_DIR, req.job_id, requested_filename)
 
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail="Video file not found")
@@ -542,7 +544,7 @@ async def add_subtitles_v2(req: SubtitleRequest):
 
         # Return subtitled video URL
         subtitled_filename = os.path.basename(output_path)
-        new_url = f"/videos/{req.job_id}/{subtitled_filename}"
+        new_url = build_video_url(req.job_id, subtitled_filename)
 
         return {"success": True, "subtitled_video_url": new_url}
 
@@ -589,7 +591,7 @@ async def post_to_socials(req: SocialPostRequest):
         # We constructed it as: f"/videos/{job_id}/{clip_filename}"
         # And file is at f"{OUTPUT_DIR}/{job_id}/{clip_filename}"
 
-        filename = clip.video_url.split('/')[-1]
+        filename = video_filename_from_url(clip.video_url)
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
 
         if not os.path.exists(file_path):
