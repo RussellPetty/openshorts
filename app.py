@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import uuid
 import subprocess
 import threading
@@ -40,6 +42,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 500  # 500 MB limit
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+# Reject sources shorter than this before starting (0 disables). A 24s Short
+# cannot yield 15-60s clips; main.py enforces the same floor after download
+# for YouTube links, which cannot be probed here.
+MIN_SOURCE_SECONDS = int(os.environ.get("MIN_SOURCE_SECONDS", "45"))
 
 # Application State
 # Semaphore to limit concurrency to MAX_CONCURRENT_JOBS
@@ -49,6 +55,9 @@ concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 job_queue_v2 = asyncio.Queue()
 # Store API keys in memory (not in Redis for security)
 job_api_keys: Dict[str, str] = {}
+# User-facing failure reason per job, from main.py's "❌ CODE: message" lines.
+job_fail_reasons: Dict[str, str] = {}
+_FAIL_LINE = re.compile(r"❌ ([A-Z_]{3,}): (.+)")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -99,7 +108,8 @@ class SubtitleRequest(BaseModel):
     job_id: str
     clip_index: int
     position: str = "bottom"  # top, middle, bottom
-    font_size: int = 16
+    font_size: int = 16  # legacy, ignored: size comes from the preset
+    preset: str = "default"  # subtitles.CAPTION_PRESETS id
     input_filename: Optional[str] = None
 
 # ============= V2 API (Redis-backed) =============
@@ -161,6 +171,9 @@ def enqueue_output_v2(out, job_id: str, store: RedisJobStore, loop):
             decoded_line = line.decode('utf-8').strip()
             if decoded_line:
                 print(f"v2 [Job Output] {decoded_line}")
+                fail = _FAIL_LINE.search(decoded_line)
+                if fail:
+                    job_fail_reasons[job_id] = fail.group(2).strip()
                 # Schedule async Redis update
                 asyncio.run_coroutine_threadsafe(
                     store.append_log(job_id, decoded_line),
@@ -206,7 +219,9 @@ async def check_partial_results_v2(job_id: str, output_dir: str, store: RedisJob
                     title=clip.get('video_title_for_youtube_short'),
                     description_tiktok=clip.get('video_description_for_tiktok'),
                     description_instagram=clip.get('video_description_for_instagram'),
-                    description_youtube=clip.get('video_title_for_youtube_short')
+                    description_youtube=clip.get('video_title_for_youtube_short'),
+                    start=clip.get('start'),
+                    end=clip.get('end')
                 ))
 
         if ready_clips:
@@ -234,7 +249,9 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
                 title=clip.get('video_title_for_youtube_short'),
                 description_tiktok=clip.get('video_description_for_tiktok'),
                 description_instagram=clip.get('video_description_for_instagram'),
-                description_youtube=clip.get('video_title_for_youtube_short')
+                description_youtube=clip.get('video_title_for_youtube_short'),
+                start=clip.get('start'),
+                end=clip.get('end')
             ))
 
         # Store transcript for editor/subtitle features
@@ -256,7 +273,7 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
     os.makedirs(job_output_dir, exist_ok=True)
 
     # Build command
-    cmd = ["python", "-u", "main.py", "-u", job_data.input_url, "-o", job_output_dir]
+    cmd = [sys.executable, "-u", "main.py", "-u", job_data.input_url, "-o", job_output_dir]
 
     if job_data.caption_settings.include_captions:
         style = job_data.caption_settings.style
@@ -295,12 +312,14 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
             await asyncio.sleep(2)
             await check_partial_results_v2(job_id, job_output_dir, store)
 
+        t_log.join(timeout=5)  # let the reader catch main.py's last lines
         if process.returncode == 0:
             await finalize_job_v2(job_id, job_output_dir, store)
         else:
             await store.set_status(
                 job_id, JobStatus.FAILED,
-                f"Process failed with exit code {process.returncode}"
+                job_fail_reasons.get(job_id)
+                or f"Process failed with exit code {process.returncode}"
             )
 
     except Exception as e:
@@ -309,6 +328,27 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
         # Clean up API key from memory
         if job_id in job_api_keys:
             del job_api_keys[job_id]
+        job_fail_reasons.pop(job_id, None)
+
+
+def _media_duration_seconds(path_or_url: str) -> float:
+    """Container duration via ffprobe (local path or http URL); 0.0 on any
+    failure, so the check fails open."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path_or_url],
+            capture_output=True, timeout=30)
+        return float(proc.stdout.decode().strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _reject_short_source(duration: float):
+    raise HTTPException(status_code=400, detail=(
+        f"This video is only {int(duration)}s long — clip generation needs at "
+        f"least {MIN_SOURCE_SECONDS}s of material to cut from. It already is "
+        f"short-form content."))
 
 
 @app.post("/api/v2/process", response_model=ProcessResponseV2)
@@ -330,10 +370,10 @@ async def process_v2(
 
     # Get API key from header, fall back to environment variable
     api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key and not os.environ.get("FIREWORKS_API_KEY") and not os.environ.get("LLM_BASE_URL"):
         raise HTTPException(
             status_code=400,
-            detail="Missing Gemini API key. Provide X-Gemini-Key header or set GEMINI_API_KEY env var."
+            detail="No clip-selection model configured. Set FIREWORKS_API_KEY or GEMINI_API_KEY, or send X-Gemini-Key."
         )
 
     # Validate caption style
@@ -343,6 +383,14 @@ async def process_v2(
             status_code=400,
             detail=f"Invalid caption_style. Must be one of: {valid_styles}"
         )
+
+    # Too-short direct sources fail here, before a job is queued. YouTube links
+    # are checked by main.py after the download.
+    if (MIN_SOURCE_SECONDS > 0 and url.startswith(("http://", "https://"))
+            and not youtube_download.is_youtube_url(url)):
+        source_duration = await asyncio.to_thread(_media_duration_seconds, url)
+        if 0 < source_duration < MIN_SOURCE_SECONDS:
+            _reject_short_source(source_duration)
 
     job_id = str(uuid.uuid4())
     store = RedisJobStore(redis)
@@ -364,7 +412,8 @@ async def process_v2(
     await store.create_job(job)
 
     # Store API key in memory (not in Redis for security)
-    job_api_keys[job_id] = api_key
+    if api_key:
+        job_api_keys[job_id] = api_key
 
     await job_queue_v2.put(job_id)
 
@@ -535,11 +584,14 @@ async def add_subtitles_v2(req: SubtitleRequest):
         loop = asyncio.get_event_loop()
         output_path = await loop.run_in_executor(
             None,
-            subtitles.add_subtitles_to_video,
-            input_path,
-            job.result.transcript,
-            req.position,
-            req.font_size
+            lambda: subtitles.add_subtitles_to_video(
+                input_path,
+                job.result.transcript,
+                clip_start=clip.start or 0.0,
+                clip_end=clip.end,
+                position=req.position,
+                preset=req.preset,
+            )
         )
 
         # Return subtitled video URL
@@ -746,6 +798,20 @@ def _download_video(url: str, output_dir: str) -> str:
     return path
 
 
+def _has_audio(path: str) -> bool:
+    """True when ffprobe finds an audio stream (or cannot tell — fail open)."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return True
+        return bool(proc.stdout.strip())
+    except Exception:
+        return True
+
+
 def _transcribe(video_path: str) -> dict:
     """Transcribe a local audio/video file with Faster-Whisper."""
     from faster_whisper import WhisperModel
@@ -770,6 +836,9 @@ async def transcribe_url(req: TranscribeRequest):
         video_path = await asyncio.to_thread(_download_video, req.url, tmp_dir)
         if not video_path or not os.path.exists(video_path):
             raise HTTPException(status_code=400, detail="Failed to download video")
+
+        if not await asyncio.to_thread(_has_audio, video_path):
+            raise HTTPException(status_code=400, detail="This video has no audio track to transcribe.")
 
         result = await asyncio.to_thread(_transcribe, video_path)
 

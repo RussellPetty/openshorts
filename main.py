@@ -5,7 +5,8 @@ import subprocess
 import argparse
 import re
 import sys
-from scenedetect import VideoManager, SceneManager
+import uuid
+from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
 from ultralytics import YOLO
 import torch
@@ -18,9 +19,18 @@ import urllib.parse
 import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 import json
 from caption_renderer import render_caption_on_frame, extract_words_from_transcript
+import gemini_worker
+import llm_backend
+from clip_selection import (build_transcript_windows, clip_count_targets,
+                            clip_duration_bounds, dedupe_overlapping,
+                            score_batches, shortlist_target, snap_clip_to_words,
+                            trim_to_best)
+from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip,
+                          QUALITY_FAST, METADATA_SCRUB)
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -31,43 +41,10 @@ load_dotenv()
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
 
-GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
-
-⚠️ TIMESTAMP RULES (STRICT):
-- Timestamps must be ABSOLUTE SECONDS from video start (for ffmpeg -ss <start> -to <end>).
-- Numbers only, up to 3 decimals (e.g. 0, 1.250, 17.350).
-- 0 ≤ start < end ≤ {video_duration}
-- Each clip 15–60 seconds.
-- Start 0.2–0.4s BEFORE the hook, end 0.2–0.4s AFTER the payoff.
-- Cut at silence/pauses, never mid-word.
-
-VIDEO_DURATION_SECONDS: {video_duration}
-
-WORDS WITH TIMESTAMPS (array of {{w, s, e}} — word, start seconds, end seconds):
-{words_json}
-
-RULES:
-- Skip generic intros/outros and pure sponsorship segments.
-- No clips shorter than 15s or longer than 60s.
-- You MUST return at least 1 clip. If the video lacks variety, pick the single best 30–60s segment.
-- Detect the video's language and topic. Write descriptions in the SAME language as the video.
-- Descriptions should include a relevant call-to-action that matches the video's topic.
-- Order clips by predicted viral performance (best first).
-
-OUTPUT — Return ONLY valid JSON, no markdown fences, no comments:
-{{
-  "shorts": [
-    {{
-      "start": 12.340,
-      "end": 37.900,
-      "video_description_for_tiktok": "<engaging TikTok description with relevant CTA>",
-      "video_description_for_instagram": "<engaging Instagram description with relevant CTA>",
-      "video_title_for_youtube_short": "<YouTube Short title, max 100 chars>"
-    }}
-  ]
-}}
-"""
+# Sources shorter than this cannot yield a 15-60s clip; the job fails fast with
+# a clear message instead of burning a download + transcription on it.
+# MIN_SOURCE_SECONDS=0 disables the check.
+MIN_SOURCE_SECONDS = int(os.environ.get("MIN_SOURCE_SECONDS", "45"))
 
 # Load the YOLO model once (Keep for backup or scene analysis if needed)
 model = YOLO('yolov8n.pt')
@@ -159,8 +136,10 @@ class SmoothedCameraman:
         x1 = max(0, x1)
         x2 = min(self.video_width, x2)
         
-        y1 = 0
-        y2 = self.video_height
+        # A source taller than the target aspect trims both ends instead of
+        # pinning y=0 and throwing away the bottom of the frame.
+        y1 = max(0, (self.video_height - self.crop_height) // 2)
+        y2 = y1 + self.crop_height
         
         return x1, y1, x2, y2
 
@@ -348,14 +327,14 @@ def create_general_frame(frame, output_width, output_height):
     # Crop center to aspect ratio
     bg_scale = output_height / orig_h
     bg_w = int(orig_w * bg_scale)
-    bg_resized = cv2.resize(frame, (bg_w, output_height))
+    bg_resized = cv2.resize(frame, (bg_w, output_height), interpolation=cv2.INTER_LANCZOS4)
     
     # Crop center of background
     start_x = (bg_w - output_width) // 2
     if start_x < 0: start_x = 0
     background = bg_resized[:, start_x:start_x+output_width]
     if background.shape[1] != output_width:
-        background = cv2.resize(background, (output_width, output_height))
+        background = cv2.resize(background, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
         
     # Blur background
     background = cv2.GaussianBlur(background, (51, 51), 0)
@@ -363,8 +342,16 @@ def create_general_frame(frame, output_width, output_height):
     # 2. Foreground (Fit Width)
     scale = output_width / orig_w
     fg_h = int(orig_h * scale)
-    foreground = cv2.resize(frame, (output_width, fg_h))
-    
+    foreground = cv2.resize(frame, (output_width, fg_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # A source taller than the output fills the width at a height that does not
+    # fit: centre-crop it instead of indexing the frame with a negative offset,
+    # which raises rather than renders.
+    if fg_h > output_height:
+        top = (fg_h - output_height) // 2
+        foreground = foreground[top:top + output_height, :]
+        fg_h = output_height
+
     # 3. Overlay
     y_offset = (output_height - fg_h) // 2
     
@@ -423,16 +410,23 @@ def analyze_scenes_strategy(video_path, scenes):
     return strategies
 
 def detect_scenes(video_path):
-    video_manager = VideoManager([video_path])
+    video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager)
+    scene_manager.detect_scenes(video=video)
     scene_list = scene_manager.get_scene_list()
-    fps = video_manager.get_framerate()
-    video_manager.release()
+    fps = video.frame_rate
     return scene_list, fps
+
+
+def source_already_fits(orig_w, orig_h, aspect_ratio=ASPECT_RATIO, tol=0.01):
+    """True when the source is already at (or past) the target aspect.
+
+    Such a source has no width to throw away: GENERAL would shrink it into a
+    blurred bed of itself and TRACK's crop is the whole frame anyway, so a
+    vertical upload is passed straight through (upstream b4be92c).
+    """
+    return orig_w / float(orig_h) <= aspect_ratio * (1 + tol)
 
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -812,29 +806,57 @@ Technical Details: {str(e)}
     return downloaded_file, sanitized_title
 
 def process_video_to_vertical(input_video, final_output_video, transcript_words=None,
-                               caption_style=None, caption_color=None, caption_outline_color=None):
+                               caption_style=None, caption_color=None, caption_outline_color=None,
+                               clip_offset=0.0):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
-    Optionally renders captions if caption_style is provided.
+    Optionally renders legacy OpenCV captions if caption_style is provided.
+
+    ``transcript_words`` carry absolute source timestamps; ``clip_offset`` is
+    where this clip starts in the source, so caption timing lines up with the
+    clip's own timeline.
     """
     script_start_time = time.time()
     
     # Define temporary file paths based on the output name
     base_name = os.path.splitext(final_output_video)[0]
     temp_video_output = f"{base_name}_temp_video.mp4"
-    temp_audio_output = f"{base_name}_temp_audio.aac"
     
     # Clean up previous temp files if they exist
     if os.path.exists(temp_video_output): os.remove(temp_video_output)
-    if os.path.exists(temp_audio_output): os.remove(temp_audio_output)
     if os.path.exists(final_output_video): os.remove(final_output_video)
 
+    render_captions = bool(caption_style and caption_style != 'none' and transcript_words)
+    if render_captions and clip_offset:
+        transcript_words = [
+            {**w, 'start': w['start'] - clip_offset, 'end': w['end'] - clip_offset}
+            for w in transcript_words
+        ]
+
     print(f"🎬 Processing clip: {input_video}")
+    original_width, original_height = get_video_resolution(input_video)
+
+    # A source shot vertical is already the output: nothing to reframe.
+    passthrough = source_already_fits(original_width, original_height)
+    if passthrough:
+        print(f"   ↕️  Source is already {original_width}x{original_height} vertical — "
+              f"passing it through, no reframe")
+
+    if passthrough and not render_captions:
+        return finalize_clip_passthrough(input_video, final_output_video)
+
     print("   Step 1: Detecting scenes...")
-    scenes, fps = detect_scenes(input_video)
+    if passthrough:
+        scenes = []
+        cap = cv2.VideoCapture(input_video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+    else:
+        scenes, fps = detect_scenes(input_video)
     
     if not scenes:
-        print("   ❌ No scenes were detected. Using full video as one scene.")
+        if not passthrough:
+            print("   ❌ No scenes were detected. Using full video as one scene.")
         # If scene detection fails or finds nothing, treat whole video as one scene
         cap = cv2.VideoCapture(input_video)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -845,19 +867,25 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
     print(f"   ✅ Found {len(scenes)} scenes.")
 
     print("\n   🧠 Step 2: Preparing Active Tracking...")
-    original_width, original_height = get_video_resolution(input_video)
     
     OUTPUT_HEIGHT = original_height
     OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
+    if passthrough:
+        OUTPUT_WIDTH = original_width
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
+    if OUTPUT_HEIGHT % 2 != 0:
+        OUTPUT_HEIGHT += 1
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
     
     # --- New Strategy: Per-Scene Analysis ---
-    print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
-    scene_strategies = analyze_scenes_strategy(input_video, scenes)
+    if passthrough:
+        scene_strategies = ['PASSTHROUGH'] * len(scenes)
+    else:
+        print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
+        scene_strategies = analyze_scenes_strategy(input_video, scenes)
     # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
     
     print("\n   ✂️ Step 4: Processing video frames...")
@@ -865,8 +893,8 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
     command = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-r', str(fps), '-i', '-', *video_encode_args(QUALITY_FAST),
+        '-pix_fmt', 'yuv420p', '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -901,7 +929,12 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
             current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
             
             # Apply Strategy
-            if current_strategy == 'GENERAL':
+            if current_strategy == 'PASSTHROUGH':
+                if frame.shape[1] != OUTPUT_WIDTH or frame.shape[0] != OUTPUT_HEIGHT:
+                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+                else:
+                    output_frame = frame
+            elif current_strategy == 'GENERAL':
                 # "Plano General" -> Blur Background + Fit Width
                 output_frame = create_general_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
                 
@@ -931,12 +964,12 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
                 # Crop
                 if y2 > y1 and x2 > x1:
                     cropped = frame[y1:y2, x1:x2]
-                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
                 else:
-                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
 
             # Render captions if enabled
-            if caption_style and caption_style != 'none' and transcript_words:
+            if render_captions:
                 current_time = frame_number / fps
                 output_frame = render_caption_on_frame(
                     output_frame, transcript_words, current_time,
@@ -959,27 +992,16 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
         print("   Stderr:", stderr_output)
         return False
 
-    print("\n   🔊 Step 5: Extracting audio...")
-    audio_extract_command = [
-        'ffmpeg', '-y', '-i', input_video, '-vn', '-acodec', 'copy', temp_audio_output
+    print("\n   ✨ Step 5: Merging audio...")
+    # Audio comes straight from the cut (already AAC + loudness-normalised by
+    # cut_clip); anything else is encoded to AAC so the MP4 plays everywhere.
+    merge_command = [
+        'ffmpeg', '-y', '-i', temp_video_output, '-i', input_video,
+        '-map', '0:v:0', '-map', '1:a:0?',
+        '-c:v', 'copy', *_aac_args_for(input_video),
+        *METADATA_SCRUB, '-movflags', '+faststart', '-shortest',
+        final_output_video
     ]
-    try:
-        subprocess.run(audio_extract_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        print("\n   ❌ Audio extraction failed (maybe no audio?). Proceeding without audio.")
-        pass
-
-    print("\n   ✨ Step 6: Merging...")
-    if os.path.exists(temp_audio_output):
-        merge_command = [
-            'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
-            '-c:v', 'copy', '-c:a', 'copy', final_output_video
-        ]
-    else:
-         merge_command = [
-            'ffmpeg', '-y', '-i', temp_video_output,
-            '-c:v', 'copy', final_output_video
-        ]
         
     try:
         subprocess.run(merge_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -991,11 +1013,103 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
 
     # Clean up temp files
     if os.path.exists(temp_video_output): os.remove(temp_video_output)
-    if os.path.exists(temp_audio_output): os.remove(temp_audio_output)
     
     return True
 
+
+def _audio_codec(path):
+    """Codec name of the first audio stream, or None when there is none."""
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+             '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', path],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _video_format(path):
+    """(codec, pix_fmt) of the first video stream, or None."""
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name,pix_fmt', '-of', 'csv=p=0', path],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        codec, pix_fmt = out.split(',')[:2]
+        return codec, pix_fmt
+    except Exception:
+        return None
+
+
+def has_audio_stream(path):
+    return _audio_codec(path) is not None
+
+
+def _aac_args_for(path):
+    """Copy AAC audio untouched; re-encode anything else to AAC."""
+    return ['-c:a', 'copy'] if _audio_codec(path) == 'aac' else ['-c:a', 'aac']
+
+
+def finalize_clip_passthrough(input_video, final_output_video):
+    """Keep the clip's native framing (already-vertical source).
+
+    The input is the freshly encoded cut, so a stream-copy remux is enough to
+    add +faststart — re-encoding here would only cost time and quality.
+    """
+    if os.path.exists(final_output_video):
+        os.remove(final_output_video)
+    # Stream-copy only what every player handles (H.264 4:2:0); a 10-bit or
+    # 4:4:4 cut is re-encoded instead of shipped unplayable on iOS/Safari.
+    video_args = ['-c:v', 'copy']
+    if _video_format(input_video) != ('h264', 'yuv420p'):
+        video_args = [*video_encode_args(QUALITY_FAST), '-pix_fmt', 'yuv420p']
+    cmd = [
+        'ffmpeg', '-y', '-i', input_video,
+        *video_args, *_aac_args_for(input_video),
+        *METADATA_SCRUB, '-movflags', '+faststart',
+        final_output_video,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+    except subprocess.CalledProcessError as e:
+        print("   ❌ Passthrough remux failed.")
+        print("   Stderr:", e.stderr.decode(errors='replace'))
+        return False
+    print(f"   ✅ Clip saved to {final_output_video}")
+    return True
+
+
+def burn_preset_captions(clip_path, transcript, clip_start, clip_end, preset, color=None):
+    """Burn an ASS caption preset (karaoke / trending looks) onto a finished
+    clip, in place. Fail-open: a caption problem never costs the clip."""
+    import subtitles as _subs
+    output_dir = os.path.dirname(clip_path)
+    # Neutral names: the .ass path is interpolated into an ffmpeg filter, where
+    # an apostrophe from the video title would break it (upstream be4dd06).
+    tmp_out = os.path.join(output_dir, f"captioned_{uuid.uuid4().hex[:8]}.mp4")
+    try:
+        if not _subs.burn_preset_captions(clip_path, transcript, clip_start, clip_end,
+                                          tmp_out, preset=preset, font_color=color):
+            print("   ℹ️ No words in range — clip ships without captions.")
+            return False
+        os.replace(tmp_out, clip_path)
+        print(f"   💬 Captions burned ({preset}).")
+        return True
+    except Exception as e:
+        print(f"   ⚠️ Captions failed ({type(e).__name__}: {e}) — delivering the clip without them.")
+        return False
+    finally:
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+
+class NoAudioError(RuntimeError):
+    """The source has no audio track, so there is nothing to transcribe."""
+
+
 def transcribe_video(video_path):
+    if not has_audio_stream(video_path):
+        raise NoAudioError("This video has no audio track")
     print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
     from faster_whisper import WhisperModel
     
@@ -1039,100 +1153,391 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def get_viral_clips(transcript_result, video_duration):
-    print("🤖  Analyzing with Gemini...")
-    
+
+# --- Clip selection (upstream 2-pass: score windows -> detail shortlist) ----
+# Primary model: DeepSeek V4.1 Flash on Fireworks via llm_backend (switched on
+# by FIREWORKS_API_KEY). Gemini is the fallback when that lane fails, and the
+# only option for the silent-video vision path.
+
+_TRANSIENT_TOKENS = (
+    '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
+    '500', 'INTERNAL', 'overloaded', 'Deadline',
+    'empty response body', 'did not contain a JSON object',
+    'Failed to parse Gemini JSON response',
+    'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
+    'validation error', 'timed out')
+
+
+def _gemini_model_name():
+    return os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+
+
+def _run_llm_stage(lane, prompt, schema):
+    """One schema-enforced model call with transient-error backoff.
+    ``lane`` is ("llm", model) or ("gemini", client, model).
+    Returns (parsed_dict, cost_analysis)."""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if lane[0] == "llm":
+                return llm_backend.generate_json(prompt, schema, model=lane[1])
+            client, model_name = lane[1], lane[2]
+            config = genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=schema,
+            )
+            response = client.models.generate_content(model=model_name, contents=prompt, config=config)
+            # Policy blocks are deterministic — retrying only burns quota.
+            gemini_worker.raise_if_blocked(response)
+            # Parsing lives inside the retry loop on purpose: Gemini sometimes
+            # returns 200 with an empty body; the same payload succeeds on retry.
+            parsed_obj = getattr(response, "parsed", None)
+            if parsed_obj is not None:
+                parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
+            else:
+                parsed = gemini_worker._parse_json_response_text(
+                    gemini_worker._get_response_text(response))
+            return parsed, gemini_worker._calculate_cost_analysis(response, model_name)
+        except gemini_worker.GeminiBlockedError:
+            raise  # deterministic policy block — never retry
+        except Exception as e:
+            msg = str(e)
+            transient = any(tok in msg for tok in _TRANSIENT_TOKENS)
+            if attempt == max_attempts or not transient:
+                raise
+            wait = 5 * (2 ** (attempt - 1))
+            who = "LLM" if lane[0] == "llm" else "Gemini"
+            print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
+            time.sleep(wait)
+
+
+def _run_stage_split(lane, items, build_prompt, schema, key, costs, label):
+    """Run a selection stage over ``items``; on a content-policy block, bisect.
+
+    Google's prompt filter fires on some COMBINATIONS of transcript windows
+    that pass individually, so instead of failing the job the batch is split
+    in halves until the offending window is isolated and dropped."""
+    if not items:
+        return []
+    prompt = build_prompt(items)
+    try:
+        parsed, cost = _run_llm_stage(lane, prompt, schema)
+        if cost:
+            costs.append(cost)
+        return list(parsed.get(key) or [])
+    except gemini_worker.GeminiBlockedError as e:
+        if len(items) == 1:
+            print(f"   🚫 {label}: blocked window {items[0].get('id')} on its own; skipping it ({e})")
+            return []
+        mid = len(items) // 2
+        print(f"   🚫 {label}: blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")
+        return (_run_stage_split(lane, items[:mid], build_prompt, schema, key, costs, label)
+                + _run_stage_split(lane, items[mid:], build_prompt, schema, key, costs, label))
+
+
+def score_batch_size():
+    """Transcript windows per scoring call (``LLM_SCORE_BATCH`` overrides).
+    Both DeepSeek V4.1 Flash and Gemini have 1M-token context, so 8."""
+    raw = os.environ.get("LLM_SCORE_BATCH", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 8
+
+
+def _selection_lanes():
+    lanes = []
+    if llm_backend.active():
+        lanes.append(("llm", llm_backend.model_name()))
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
-        return None
+    if api_key:
+        lanes.append(("gemini", genai.Client(api_key=api_key), _gemini_model_name()))
+    return lanes
 
 
-    client = genai.Client(api_key=api_key)
-    
-    # We use gemini-2.5-flash as requested.
-    model_name = 'gemini-2.5-flash' 
-    
-    print(f"🤖  Initializing Gemini with model: {model_name}")
+def _lane_label(lane):
+    return f"{lane[1]} @ {llm_backend.base_url()}" if lane[0] == "llm" else lane[2]
 
-    # Extract words
+
+def _select_clips_with(lane, transcript_result, video_duration):
+    """Two-pass clip selection on one model lane. Returns (shorts, costs)."""
+    language = str(transcript_result.get('language') or 'unknown')
+
+    # Full word list — ground truth for snapping cut points.
     words = []
     for segment in transcript_result['segments']:
         for word in segment.get('words', []):
-            words.append({
-                'w': word['word'],
-                's': word['start'],
-                'e': word['end']
-            })
+            words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
 
-    prompt = GEMINI_PROMPT_TEMPLATE.format(
-        video_duration=video_duration,
-        words_json=json.dumps(words)
-    )
+    # Scoring windows must be able to CONTAIN a max-length clip.
+    min_secs, max_secs = clip_duration_bounds()
+    windows = build_transcript_windows(
+        transcript_result, video_duration,
+        window_seconds=max(90, int(max_secs * 1.5)))
+    print(f"   Built {len(windows)} scoring window(s).")
+    costs = []
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
-        
-        # --- Cost Calculation ---
-        try:
-            usage = response.usage_metadata
-            if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
-                
-                input_price_per_million = 0.10
-                output_price_per_million = 0.40
-                
-                prompt_tokens = usage.prompt_token_count
-                output_tokens = usage.candidates_token_count
-                
-                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-                output_cost = (output_tokens / 1_000_000) * output_price_per_million
-                total_cost = input_cost + output_cost
-                
-                cost_analysis = {
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                    "input_cost": input_cost,
-                    "output_cost": output_cost,
-                    "total_cost": total_cost,
-                    "model": model_name
-                }
+    # --- Pass 1: score every window, keep the global top `target` ---
+    scored = []
+    target = shortlist_target(video_duration)
 
-                print(f"💰 Token Usage ({model_name}):")
-                print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
-                print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
-                print(f"   - Total Estimated Cost: ${total_cost:.6f}")
-                
-        except Exception as e:
-            print(f"⚠️ Could not calculate cost: {e}")
-            cost_analysis = None
-        # ------------------------
+    def _payload(ws):
+        return [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in ws]
 
-        # Clean response if it contains markdown code blocks
-        text = response.text
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        result_json = json.loads(text)
-        if cost_analysis:
-            result_json['cost_analysis'] = cost_analysis
-            
-        return result_json
-    except Exception as e:
-        import traceback
-        print(f"❌ Gemini Error: {e}")
-        print(f"❌ Gemini Traceback: {traceback.format_exc()}")
-        if 'response' in dir() and hasattr(response, 'text'):
-            print(f"❌ Gemini raw response (first 500 chars): {response.text[:500]}")
+    def _score_prompt(ws):
+        return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            video_duration=video_duration, language=language,
+            windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+
+    for batch in score_batches(windows, score_batch_size()):
+        scored.extend(_run_stage_split(
+            lane, batch, _score_prompt,
+            gemini_worker.ScoreResponse, "windows", costs, "score"))
+
+    scored.sort(key=lambda w: w.get("score", 0), reverse=True)
+    by_id = {w["id"]: w for w in windows}
+    shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
+    if not shortlist:
+        shortlist = windows[:target]  # scoring returned nothing usable
+    print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
+
+    # --- Pass 2: detailed clip extraction on the shortlist ---
+    min_clips, max_clips = clip_count_targets(len(shortlist))
+
+    def _detail_prompt_for(lo, hi):
+        def build(ws):
+            return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                video_duration=video_duration, language=language,
+                min_clips=lo, max_clips=hi,
+                min_secs=min_secs, max_secs=max_secs,
+                windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+        return build
+
+    shorts = _run_stage_split(lane, shortlist,
+                              _detail_prompt_for(min_clips, max_clips),
+                              gemini_worker.DetailResponse, "shorts", costs, "detail")
+
+    # The floor lives only in the prompt; give the unused windows one more
+    # call for the missing clips.
+    if len(shorts) < min_clips:
+        used = {str(s.get("source_window_id") or "") for s in shorts}
+        spare = [w for w in shortlist if w["id"] not in used]
+        if spare:
+            missing = min_clips - len(shorts)
+            print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
+                  f"asking the {len(spare)} unused window(s) for {missing} more.")
+            extra = _run_stage_split(
+                lane, spare, _detail_prompt_for(missing, max(missing, len(spare))),
+                gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+            if extra:
+                shorts = sorted(shorts + extra, key=lambda s: float(s.get("start") or 0))
+                print(f"   Recovered {len(extra)} clip(s) from them.")
+
+    if len(shorts) > max_clips:
+        # By score, never by position (upstream 4a13700).
+        dropped = len(shorts) - max_clips
+        shorts = trim_to_best(shorts, max_clips)
+        print(f"   Kept the {max_clips} best-scoring clip(s) of {max_clips + dropped}.")
+
+    # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+    for s in shorts:
+        s["proposed"] = [s.get("start", 0), s.get("end", 0)]
+        ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
+                                    min_duration=min_secs, max_duration=max_secs)
+        s["start"], s["end"] = ns, ne
+    deduped = dedupe_overlapping(shorts)
+    if len(deduped) < len(shorts):
+        print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a better-scored one.")
+        shorts = deduped
+    return shorts, costs
+
+
+def get_viral_clips(transcript_result, video_duration):
+    """Pick clips from the transcript: DeepSeek first, Gemini as fallback.
+    Returns {"shorts": [...], "cost_analysis": {...}} or None."""
+    lanes = _selection_lanes()
+    if not lanes:
+        print("❌ Error: no clip-selection model configured "
+              "(set FIREWORKS_API_KEY or GEMINI_API_KEY).")
         return None
+
+    print(f"🤖  Analyzing transcript (2-pass: score → detail), language: "
+          f"{transcript_result.get('language') or 'unknown'}")
+    blocked = None
+    for lane in lanes:
+        label = _lane_label(lane)
+        print(f"🤖  Model: {label}")
+        try:
+            shorts, costs = _select_clips_with(lane, transcript_result, video_duration)
+        except gemini_worker.GeminiBlockedError as e:
+            print(f"🚫 {e}")
+            blocked = e
+            continue
+        except Exception as e:
+            print(f"❌ Clip selection failed on {label}: {type(e).__name__}: {e}")
+            continue
+        if not shorts:
+            print(f"⚠️ {label} returned no clips.")
+            continue
+
+        result = {"shorts": shorts}
+        if costs:
+            result["cost_analysis"] = {
+                "input_tokens": sum(c.get("input_tokens", 0) for c in costs),
+                "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
+                "total_cost": sum(c.get("total_cost", 0) for c in costs),
+                "model": costs[-1].get("model"),
+                "calls": len(costs),
+            }
+            print(f"💰 {len(costs)} selection call(s) on {label}: "
+                  f"{result['cost_analysis']['input_tokens']} in / "
+                  f"{result['cost_analysis']['output_tokens']} out tokens")
+        return result
+
+    if blocked is not None:
+        # Content-policy rejection with nothing else to try: fail with the
+        # real reason instead of a generic "no clips found".
+        raise blocked
+    return None
+
+
+# --- Speech too sparse to clip by transcript -------------------------------
+MIN_SPEECH_WORDS_PER_MIN = float(os.environ.get("MIN_SPEECH_WORDS_PER_MIN", "5"))
+MIN_SPEECH_WORDS = int(os.environ.get("MIN_SPEECH_WORDS", "8"))
+
+
+def speech_is_sparse(transcript, duration):
+    """True when the transcript is too thin to drive clip selection."""
+    words = sum(len((seg.get("text") or "").split())
+                for seg in (transcript or {}).get("segments", []))
+    minutes = max(float(duration or 0) / 60.0, 1e-6)
+    return words < MIN_SPEECH_WORDS or words / minutes < MIN_SPEECH_WORDS_PER_MIN
+
+
+def get_visual_clips(video_path, video_duration, language="en"):
+    """Clip a SILENT (or speechless) video by vision: Gemini watches the
+    footage and picks the most engaging visual moments. Returns the same
+    {"shorts", "cost_analysis"} shape as get_viral_clips, or None."""
+    print("🎥  No usable speech — analyzing with Gemini vision (no transcript)...")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ Error: GEMINI_API_KEY not found (needed for silent videos).")
+        return None
+    client = genai.Client(api_key=api_key)
+    model_name = _gemini_model_name()
+    print(f"🎥  Model: {model_name} | uploading {os.path.basename(video_path)}…")
+
+    file_upload = None
+    try:
+        # By handle, not path: a non-ASCII title in the filename breaks the
+        # SDK's upload header (upstream ff2fd10).
+        file_upload = gemini_worker.upload_media(client, video_path)
+        deadline = time.time() + 180
+        while True:
+            info = client.files.get(name=file_upload.name)
+            state = str(getattr(getattr(info, "state", info), "name", "")).upper()
+            if state == "ACTIVE":
+                break
+            if state == "FAILED":
+                print("❌ Gemini could not process the video.")
+                return None
+            if time.time() > deadline:
+                print("❌ Gemini video processing timed out.")
+                return None
+            time.sleep(2)
+
+        prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
+            video_duration=video_duration, language=language)
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=gemini_worker.VisualResponse,
+        )
+        response = client.models.generate_content(
+            model=model_name, contents=[file_upload, prompt], config=config)
+        gemini_worker.raise_if_blocked(response)
+        parsed = gemini_worker._parse_json_response_text(gemini_worker._get_response_text(response))
+        shorts = parsed.get("shorts") or []
+        # Clamp to the real duration; drop anything degenerate.
+        clean = []
+        for s in shorts:
+            s["start"] = max(0.0, float(s.get("start", 0)))
+            s["end"] = min(float(video_duration), float(s.get("end", 0)))
+            if s["end"] - s["start"] >= 1.0:
+                clean.append(s)
+        if not clean:
+            print("⚠️ Vision pass returned no usable clips.")
+            return None
+
+        cost = gemini_worker._calculate_cost_analysis(response, model_name)
+        result = {"shorts": clean}
+        if cost:
+            result["cost_analysis"] = cost
+        return result
+    except gemini_worker.GeminiBlockedError:
+        raise
+    except Exception as e:
+        print(f"❌ Gemini vision error: {e}")
+        return None
+    finally:
+        if file_upload is not None:
+            try:
+                client.files.delete(name=file_upload.name)
+            except Exception:
+                pass
+
+
+def _fail(code, message):
+    """Exit the job with a user-facing reason app.py can surface."""
+    msg = f"❌ {code}: {message}"
+    print(msg, file=sys.stdout)
+    print(msg, file=sys.stderr)
+    sys.stdout.flush(); sys.stderr.flush()
+    raise SystemExit(1)
+
+
+# Caption styles rendered from ASS presets (proper fonts, word-level karaoke
+# highlight). The remaining styles are the legacy OpenCV renderer.
+ASS_CAPTION_STYLES = ('karaoke', 'default', 'hormozi', 'pill', 'lime', 'oneword', 'clean')
+LEGACY_CAPTION_STYLES = ('classic', 'boxed', 'yellow', 'minimal', 'bold', 'neon', 'gradient')
+
+
+def _probe_duration(path):
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if fps > 0 and frame_count > 0:
+        return frame_count / fps
+    try:
+        out = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                              '-of', 'csv=p=0', path], capture_output=True, text=True, timeout=60)
+        return float(out.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def render_clip_file(input_video, clip_path, start, end, clip_number, transcript, all_words,
+                     caption_style, caption_color, caption_outline_color):
+    """Cut [start, end] from the source, reframe to 9:16 and caption it."""
+    clip_temp_path = os.path.join(os.path.dirname(clip_path),
+                                  f"temp_{uuid.uuid4().hex[:8]}_{os.path.basename(clip_path)}")
+    try:
+        cut_clip(input_video, clip_temp_path, start, end, clip_number)
+        legacy = caption_style in LEGACY_CAPTION_STYLES
+        success = process_video_to_vertical(
+            clip_temp_path, clip_path,
+            all_words if legacy else None,
+            caption_style if legacy else None, caption_color, caption_outline_color,
+            clip_offset=start)
+        if success and caption_style in ASS_CAPTION_STYLES and transcript:
+            burn_preset_captions(clip_path, transcript, start, end, caption_style, caption_color)
+        return success
+    finally:
+        if os.path.exists(clip_temp_path):
+            os.remove(clip_temp_path)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
@@ -1145,7 +1550,7 @@ if __name__ == '__main__':
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
     parser.add_argument('--caption-style', type=str,
-                        choices=['classic', 'boxed', 'yellow', 'minimal', 'bold', 'karaoke', 'neon', 'gradient', 'none'],
+                        choices=list(LEGACY_CAPTION_STYLES) + list(ASS_CAPTION_STYLES) + ['none'],
                         default='none', help="Caption style to apply")
     parser.add_argument('--caption-color', type=str, help="Custom text color in hex (e.g. #FFFFFF)")
     parser.add_argument('--caption-outline-color', type=str, help="Custom outline color in hex (e.g. #000000)")
@@ -1201,47 +1606,66 @@ if __name__ == '__main__':
     caption_color = getattr(args, 'caption_color', None)
     caption_outline_color = getattr(args, 'caption_outline_color', None)
 
+    duration = _probe_duration(input_video)
+
     # 2. Decision: Analyze clips or process whole?
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
 
-        # If captions requested but skip_analysis, we need to transcribe for captions
-        transcript_words = None
-        if caption_style and caption_style != 'none':
+        transcript = None
+        if caption_style and caption_style != 'none' and has_audio_stream(input_video):
             print("📝 Transcribing for captions...")
             transcript = transcribe_video(input_video)
-            transcript_words = extract_words_from_transcript(transcript)
-
-        process_video_to_vertical(input_video, output_file, transcript_words,
-                                  caption_style, caption_color, caption_outline_color)
+        render_clip_file(input_video, output_file, 0, duration, 1, transcript,
+                         extract_words_from_transcript(transcript),
+                         caption_style, caption_color, caption_outline_color)
     else:
-        # 3. Transcribe
-        transcript = transcribe_video(input_video)
+        # Too-short sources cannot yield a 15-60s clip (upstream 730f7de).
+        if MIN_SOURCE_SECONDS > 0 and 0 < duration < MIN_SOURCE_SECONDS:
+            _fail("SOURCE_TOO_SHORT",
+                  f"This video is only {int(duration)}s long — clip generation needs at least "
+                  f"{MIN_SOURCE_SECONDS}s of material to cut from. It already is short-form content.")
 
-        # Extract words for captions
+        # 3. Transcribe — unless the video has no audio (or no real speech), in
+        # which case Gemini vision picks clips from the imagery instead.
+        transcript = None
+        try:
+            transcript = transcribe_video(input_video)
+        except NoAudioError as e:
+            print(f"🔇 {e} — switching to visual analysis.")
+
+        try:
+            if transcript is not None and not speech_is_sparse(transcript, duration):
+                clips_data = get_viral_clips(transcript, duration)
+            else:
+                if transcript is not None:
+                    print("🔇 Too little speech to clip by transcript — switching to visual analysis.")
+                clips_data = get_visual_clips(input_video, duration,
+                                              language=(transcript or {}).get('language') or 'en')
+        except gemini_worker.GeminiBlockedError as e:
+            _fail("CONTENT_BLOCKED", str(e))
+
+        # Extract words for captions (absolute source timestamps)
         all_words = extract_words_from_transcript(transcript)
-
-        # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
-
-        # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
+        if transcript is None:
+            transcript = {"language": "none", "segments": [], "text": ""}
 
         if not clips_data or 'shorts' not in clips_data:
-            print("⚠️ Gemini did not return clips. Creating single full-video clip as fallback.")
+            # Keep the job useful: one vertical clip from the start of the
+            # video, capped at the max clip length (rendering a whole
+            # hour-long source as a single "clip" helped nobody).
+            _, max_secs = clip_duration_bounds()
+            fallback_end = min(duration, max_secs) if duration else max_secs
+            print(f"⚠️ No clips identified. Creating a single {fallback_end:.0f}s clip as fallback.")
             output_file = os.path.join(output_dir, f"{video_title}_clip_1.mp4")
-            process_video_to_vertical(input_video, output_file, all_words,
-                                      caption_style, caption_color, caption_outline_color)
+            render_clip_file(input_video, output_file, 0, fallback_end, 1, transcript, all_words,
+                             caption_style, caption_color, caption_outline_color)
             # Write fallback metadata so app.py can finalize the job
             fallback_metadata = {
                 "shorts": [{
                     "start": 0,
-                    "end": duration,
+                    "end": fallback_end,
                     "video_title_for_youtube_short": video_title,
                     "video_description_for_tiktok": "",
                     "video_description_for_instagram": ""
@@ -1269,34 +1693,16 @@ if __name__ == '__main__':
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
                 print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
                 
-                # Cut clip
                 clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
-                
-                # ffmpeg cut
-                # Using re-encoding for precision as requested by strict seconds
-                cut_command = [
-                    'ffmpeg', '-y', 
-                    '-ss', str(start), 
-                    '-to', str(end), 
-                    '-i', input_video,
-                    '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-                    '-c:a', 'aac',
-                    clip_temp_path
-                ]
-                subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-                # Process vertical with captions
-                success = process_video_to_vertical(clip_temp_path, clip_final_path, all_words,
-                                                      caption_style, caption_color, caption_outline_color)
-                
-                if success:
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                
-                # Clean up temp cut
-                if os.path.exists(clip_temp_path):
-                    os.remove(clip_temp_path)
+                try:
+                    success = render_clip_file(input_video, clip_final_path, start, end, i + 1,
+                                               transcript, all_words,
+                                               caption_style, caption_color, caption_outline_color)
+                    if success:
+                        print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+                except Exception as e:
+                    print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):

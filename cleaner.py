@@ -88,7 +88,8 @@ def apply_cuts(input_path, output_path, keep_ranges):
         'ffmpeg', '-y', '-i', input_path,
         '-filter_complex', ";".join(filter_parts),
         '-map', '[outv]', '-map', '[outa]',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+        '-c:a', 'aac', '-movflags', '+faststart',
         output_path
     ]
     subprocess.run(cmd, check=True)

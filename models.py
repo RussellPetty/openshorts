@@ -13,6 +13,13 @@ class CaptionStyleEnum(str, Enum):
     KARAOKE = "karaoke"
     NEON = "neon"
     GRADIENT = "gradient"
+    # ASS presets (subtitles.CAPTION_PRESETS): word-level karaoke highlight
+    DEFAULT = "default"
+    HORMOZI = "hormozi"
+    PILL = "pill"
+    LIME = "lime"
+    ONEWORD = "oneword"
+    CLEAN = "clean"
     NONE = "none"
 
 
@@ -36,6 +43,8 @@ class ClipResult(BaseModel):
     description_tiktok: Optional[str] = None
     description_instagram: Optional[str] = None
     description_youtube: Optional[str] = None
+    start: Optional[float] = None  # clip position in the source, seconds
+    end: Optional[float] = None
 
 
 class JobResult(BaseModel):

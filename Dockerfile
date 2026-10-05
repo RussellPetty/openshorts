@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
     fonts-tlwg-loma-otf \
     libfontconfig1 \
+    fontconfig \
     libgdk-pixbuf-2.0-0 \
     libnss3 \
     libnspr4 \
@@ -105,6 +106,13 @@ ENV PYTHONUNBUFFERED=1
 
 # Copy application code
 COPY . .
+
+# Register the bundled caption fonts (Anton, Montserrat ExtraBold) and the
+# UI-name -> real-font aliases with fontconfig so libass resolves the presets.
+RUN mkdir -p /usr/local/share/fonts/openshorts \
+    && cp fonts/*.ttf /usr/local/share/fonts/openshorts/ \
+    && cp fonts/openshorts-fontmap.conf /etc/fonts/conf.d/60-openshorts.conf \
+    && fc-cache -f
 
 # Create a non-root user (Moved up)
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
