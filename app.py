@@ -63,12 +63,38 @@ RENDER_FAILED_MESSAGE = ("We picked clips from this video but couldn't render an
 job_fail_reasons: Dict[str, str] = {}
 _FAIL_LINE = re.compile(r"❌ ([A-Z_]{3,}): (.+)")
 
+INTERRUPTED_MESSAGE = ("This job was interrupted by a server restart before it finished. "
+                       "Please submit the video again.")
+
+
+async def fail_orphaned_jobs(store: RedisJobStore) -> None:
+    """Jobs still queued/processing at startup belonged to the previous
+    process (the queue and the main.py subprocesses live in memory), so they
+    will never finish. Fail them with a resubmit message instead of leaving
+    them "processing" until the 24h TTL."""
+    from job_store import JOB_KEY_PREFIX
+    failed = 0
+    try:
+        async for key in store.redis.scan_iter(match=f"{JOB_KEY_PREFIX}*", count=200):
+            key = key.decode() if isinstance(key, bytes) else key
+            job_id = key[len(JOB_KEY_PREFIX):]
+            job = await store.get_job(job_id)
+            if job and job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                await store.set_status(job_id, JobStatus.FAILED, INTERRUPTED_MESSAGE)
+                failed += 1
+    except Exception as e:
+        print(f"⚠️ Orphaned-job sweep failed: {e}")
+    if failed:
+        print(f"⚠️ Marked {failed} job(s) interrupted by the restart as failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start v2 worker if Redis available
     redis = await get_redis()
     v2_worker_task = None
     if redis:
+        await fail_orphaned_jobs(RedisJobStore(redis))
         v2_worker_task = asyncio.create_task(process_queue_v2())
         print("✅ Redis connected, V2 API enabled")
     else:
@@ -347,6 +373,7 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
         if job_id in job_api_keys:
             del job_api_keys[job_id]
         job_fail_reasons.pop(job_id, None)
+        store.forget(job_id)
 
 
 def _media_duration_seconds(path_or_url: str) -> float:

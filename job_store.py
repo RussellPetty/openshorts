@@ -1,4 +1,6 @@
-from typing import Optional, Any
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Dict, Optional, Any
 from datetime import datetime
 from redis.asyncio import Redis
 from models import JobData, JobStatus, JobResult
@@ -7,9 +9,28 @@ JOB_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 JOB_KEY_PREFIX = "openshorts:job:"
 
 
+# Every write is a read-modify-write of the whole job JSON, and the log reader
+# fires one per output line concurrently with progress/result updates. Without
+# serialising them, a stale append_log wrote back an old copy over newer
+# fields: progress stuck at "10% Downloading video" for the whole job, log
+# lines went missing, and a partial result could be clobbered (prod 5-oct-2026).
+# One process, one event loop, so a per-job asyncio.Lock is enough.
+_job_locks: Dict[str, asyncio.Lock] = {}
+
+
 class RedisJobStore:
     def __init__(self, redis: Redis):
         self.redis = redis
+
+    @asynccontextmanager
+    async def _locked(self, job_id: str):
+        lock = _job_locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            yield
+
+    def forget(self, job_id: str) -> None:
+        """Drop a finished job's lock."""
+        _job_locks.pop(job_id, None)
 
     def _key(self, job_id: str) -> str:
         return f"{JOB_KEY_PREFIX}{job_id}"
@@ -30,6 +51,10 @@ class RedisJobStore:
 
     async def update_job(self, job_id: str, **updates: Any) -> Optional[JobData]:
         """Update specific fields of a job."""
+        async with self._locked(job_id):
+            return await self._update_job_unlocked(job_id, **updates)
+
+    async def _update_job_unlocked(self, job_id: str, **updates: Any) -> Optional[JobData]:
         job = await self.get_job(job_id)
         if not job:
             return None
@@ -44,10 +69,11 @@ class RedisJobStore:
 
     async def append_log(self, job_id: str, message: str) -> None:
         """Append a log message to job."""
-        job = await self.get_job(job_id)
-        if job:
-            job.logs.append(message)
-            await self.create_job(job)
+        async with self._locked(job_id):
+            job = await self.get_job(job_id)
+            if job:
+                job.logs.append(message)
+                await self.create_job(job)
 
     async def set_status(
         self,
@@ -56,21 +82,22 @@ class RedisJobStore:
         error: Optional[str] = None
     ) -> None:
         """Update job status with appropriate timestamps."""
-        job = await self.get_job(job_id)
-        if not job:
-            return
+        async with self._locked(job_id):
+            job = await self.get_job(job_id)
+            if not job:
+                return
 
-        job.status = status
-        now = datetime.utcnow()
+            job.status = status
+            now = datetime.utcnow()
 
-        if status == JobStatus.PROCESSING:
-            job.started_at = now
-        elif status in (JobStatus.COMPLETED, JobStatus.FAILED):
-            job.completed_at = now
-            if error:
-                job.error = error
+            if status == JobStatus.PROCESSING:
+                job.started_at = now
+            elif status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                job.completed_at = now
+                if error:
+                    job.error = error
 
-        await self.create_job(job)
+            await self.create_job(job)
 
     async def update_progress(
         self,
@@ -79,14 +106,15 @@ class RedisJobStore:
         stage: Optional[str] = None
     ) -> None:
         """Update job progress without allowing late log lines to move it backward."""
-        job = await self.get_job(job_id)
-        if not job or percentage < job.progress_percentage:
-            return
+        async with self._locked(job_id):
+            job = await self.get_job(job_id)
+            if not job or percentage < job.progress_percentage:
+                return
 
-        job.progress_percentage = percentage
-        if stage:
-            job.progress_stage = stage
-        await self.create_job(job)
+            job.progress_percentage = percentage
+            if stage:
+                job.progress_stage = stage
+            await self.create_job(job)
 
     async def set_result(self, job_id: str, result: JobResult) -> None:
         """Set the job result."""
