@@ -29,6 +29,7 @@ import editor
 import subtitles
 import cleaner
 import youtube_download
+import user_errors
 from url_utils import build_video_url, video_filename_from_url
 
 # Constants
@@ -55,6 +56,9 @@ concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 job_queue_v2 = asyncio.Queue()
 # Store API keys in memory (not in Redis for security)
 job_api_keys: Dict[str, str] = {}
+RENDER_FAILED_MESSAGE = ("We picked clips from this video but couldn't render any of them. "
+                         "Please try again; if it keeps failing, re-export the video as MP4 "
+                         "(H.264) and upload it.")
 # User-facing failure reason per job, from main.py's "❌ CODE: message" lines.
 job_fail_reasons: Dict[str, str] = {}
 _FAIL_LINE = re.compile(r"❌ ([A-Z_]{3,}): (.+)")
@@ -244,6 +248,11 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
 
         for i, clip in enumerate(clips):
             clip_filename = f"{base_name}_clip_{i+1}.mp4"
+            clip_path = os.path.join(output_dir, clip_filename)
+            # A clip whose render failed has no file: leave it out rather than
+            # hand the caller a URL that 404s.
+            if not os.path.exists(clip_path) or os.path.getsize(clip_path) == 0:
+                continue
             result_clips.append(ClipResult(
                 video_url=build_video_url(job_id, clip_filename),
                 title=clip.get('video_title_for_youtube_short'),
@@ -254,13 +263,17 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
                 end=clip.get('end')
             ))
 
+        if not result_clips:
+            await store.set_status(job_id, JobStatus.FAILED, RENDER_FAILED_MESSAGE)
+            return
+
         # Store transcript for editor/subtitle features
         transcript = data.get('transcript')
         await store.set_result(job_id, JobResult(clips=result_clips, transcript=transcript))
         await store.update_progress(job_id, 100, "Completed")
         await store.set_status(job_id, JobStatus.COMPLETED)
     else:
-        await store.set_status(job_id, JobStatus.FAILED, "No metadata file generated")
+        await store.set_status(job_id, JobStatus.FAILED, user_errors.GENERIC[1])
 
 
 async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
@@ -316,14 +329,19 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
         if process.returncode == 0:
             await finalize_job_v2(job_id, job_output_dir, store)
         else:
-            await store.set_status(
-                job_id, JobStatus.FAILED,
-                job_fail_reasons.get(job_id)
-                or f"Process failed with exit code {process.returncode}"
-            )
+            print(f"v2 Job {job_id} exited with code {process.returncode}")
+            if job_fail_reasons.get(job_id):
+                reason = job_fail_reasons[job_id]
+            elif process.returncode < 0:
+                # Killed by a signal — on Railway that is the OOM killer.
+                reason = user_errors.classify("out of memory")[1]
+            else:
+                reason = user_errors.GENERIC[1]
+            await store.set_status(job_id, JobStatus.FAILED, reason)
 
     except Exception as e:
-        await store.set_status(job_id, JobStatus.FAILED, str(e))
+        print(f"v2 Job {job_id} runner error: {type(e).__name__}: {e}")
+        await store.set_status(job_id, JobStatus.FAILED, user_errors.classify(str(e))[1])
     finally:
         # Clean up API key from memory
         if job_id in job_api_keys:
@@ -383,6 +401,10 @@ async def process_v2(
             status_code=400,
             detail=f"Invalid caption_style. Must be one of: {valid_styles}"
         )
+
+    link_problem = user_errors.youtube_link_problem(url)
+    if link_problem:
+        raise HTTPException(status_code=400, detail=link_problem)
 
     # Too-short direct sources fail here, before a job is queued. YouTube links
     # are checked by main.py after the download.
@@ -831,6 +853,10 @@ async def transcribe_url(req: TranscribeRequest):
     """Download a video (YouTube or direct URL) and return its transcript."""
     import tempfile
 
+    link_problem = user_errors.youtube_link_problem(req.url)
+    if link_problem:
+        raise HTTPException(status_code=400, detail=link_problem)
+
     tmp_dir = tempfile.mkdtemp(prefix="transcribe_")
     try:
         video_path = await asyncio.to_thread(_download_video, req.url, tmp_dir)
@@ -850,6 +876,9 @@ async def transcribe_url(req: TranscribeRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"transcribe failed for {req.url}: {type(e).__name__}: {e}")
+        code, message = user_errors.classify(f"{type(e).__name__}: {e}")
+        status = 500 if code in (user_errors.GENERIC[0], "DOWNLOAD_FAILED", "NO_SPACE") else 400
+        raise HTTPException(status_code=status, detail=message)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

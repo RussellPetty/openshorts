@@ -25,6 +25,7 @@ import json
 from caption_renderer import render_caption_on_frame, extract_words_from_transcript
 import gemini_worker
 import llm_backend
+import user_errors
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target, snap_clip_to_words,
@@ -1539,7 +1540,7 @@ def render_clip_file(input_video, clip_path, start, end, clip_number, transcript
             os.remove(clip_temp_path)
 
 
-if __name__ == '__main__':
+def run():
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -1598,8 +1599,7 @@ if __name__ == '__main__':
                 output_dir = os.path.dirname(input_video)
 
     if not os.path.exists(input_video):
-        print(f"❌ Input file not found: {input_video}")
-        exit(1)
+        _fail("NOT_A_VIDEO", user_errors.classify("input file not found")[1])
 
     # Get caption parameters
     caption_style = getattr(args, 'caption_style', 'none')
@@ -1607,6 +1607,8 @@ if __name__ == '__main__':
     caption_outline_color = getattr(args, 'caption_outline_color', None)
 
     duration = _probe_duration(input_video)
+    if not duration:
+        _fail("NOT_A_VIDEO", user_errors.classify("no video stream")[1])
 
     # 2. Decision: Analyze clips or process whole?
     if args.skip_analysis:
@@ -1625,7 +1627,8 @@ if __name__ == '__main__':
         if MIN_SOURCE_SECONDS > 0 and 0 < duration < MIN_SOURCE_SECONDS:
             _fail("SOURCE_TOO_SHORT",
                   f"This video is only {int(duration)}s long — clip generation needs at least "
-                  f"{MIN_SOURCE_SECONDS}s of material to cut from. It already is short-form content.")
+                  f"{MIN_SOURCE_SECONDS}s of material to cut from. Use a longer video; this one "
+                  f"is already short-form content you can post as-is.")
 
         # 3. Transcribe — unless the video has no audio (or no real speech), in
         # which case Gemini vision picks clips from the imagery instead.
@@ -1644,7 +1647,8 @@ if __name__ == '__main__':
                 clips_data = get_visual_clips(input_video, duration,
                                               language=(transcript or {}).get('language') or 'en')
         except gemini_worker.GeminiBlockedError as e:
-            _fail("CONTENT_BLOCKED", str(e))
+            print(f"🚫 {e}")
+            _fail("CONTENT_BLOCKED", CONTENT_BLOCKED_MESSAGE)
 
         # Extract words for captions (absolute source timestamps)
         all_words = extract_words_from_transcript(transcript)
@@ -1687,6 +1691,8 @@ if __name__ == '__main__':
             print(f"   Saved metadata to {metadata_file}")
 
             # 5. Process each clip
+            rendered = 0
+            last_render_error = None
             for i, clip in enumerate(clips_data['shorts']):
                 start = clip['start']
                 end = clip['end']
@@ -1700,9 +1706,20 @@ if __name__ == '__main__':
                                                transcript, all_words,
                                                caption_style, caption_color, caption_outline_color)
                     if success:
+                        rendered += 1
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                 except Exception as e:
-                    print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
+                    last_render_error = f"{type(e).__name__}: {e}"
+                    print(f"   ❌ Clip {i+1} failed: {last_render_error}")
+
+            if rendered == 0:
+                code, message = user_errors.classify(last_render_error or "")
+                if code == user_errors.GENERIC[0]:
+                    code, message = ("RENDER_FAILED",
+                                     "We picked clips from this video but couldn't render any of "
+                                     "them. Please try again; if it keeps failing, re-export the "
+                                     "video as MP4 (H.264) and upload it.")
+                _fail(code, message)
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):
@@ -1711,3 +1728,21 @@ if __name__ == '__main__':
 
     total_time = time.time() - script_start_time
     print(f"\n⏱️  Total execution time: {total_time:.2f}s")
+
+
+CONTENT_BLOCKED_MESSAGE = ("The AI couldn't analyze this video because the provider's safety "
+                           "filters flagged its content. Try a different video.")
+
+
+if __name__ == '__main__':
+    try:
+        run()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # Anything unhandled still ends the job with something the user can act
+        # on, instead of a bare "exit code 1". The traceback stays in the logs.
+        import traceback
+        traceback.print_exc()
+        code, message = user_errors.classify(f"{type(e).__name__}: {e}")
+        _fail(code, message)

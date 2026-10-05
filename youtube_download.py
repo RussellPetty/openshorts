@@ -26,6 +26,8 @@ import time
 import urllib.parse
 import urllib.request
 
+import user_errors
+
 CHROME_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
              '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36')
 
@@ -416,4 +418,8 @@ def download_youtube(url, output_dir='.', want='video'):
             msg = f"{name}: {type(e).__name__}: {e}"
             print(f"⚠️  {msg}")
             errors.append(msg)
+            # A private/removed/restricted video fails the same way everywhere:
+            # stop here instead of spending minutes on the next service.
+            if user_errors.is_definitive_download_error(str(e)):
+                raise RuntimeError(msg)
     raise RuntimeError("all download services failed -> " + " | ".join(errors))
