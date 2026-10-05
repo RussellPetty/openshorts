@@ -36,7 +36,7 @@ from pydantic import BaseModel
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
 FIREWORKS_DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 DEFAULT_MODEL = "llama3.1:8b"
-DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_TOKENS = 32000
 DEFAULT_TIMEOUT = 600.0  # local models on CPU are slow; a scoring batch can take minutes
 
 
@@ -68,6 +68,16 @@ def model_name() -> str:
     if base_url() == FIREWORKS_BASE_URL:
         return FIREWORKS_DEFAULT_MODEL
     return DEFAULT_MODEL
+
+
+def _reasoning_effort() -> Optional[str]:
+    """``LLM_REASONING_EFFORT`` (none|low|medium|high), default "low" on
+    Fireworks. Unbounded reasoning on the detail pass spent the whole output
+    budget thinking and returned an empty body (prod, 5-oct-2026)."""
+    raw = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
+    if raw:
+        return None if raw == "default" else raw
+    return "low" if base_url() == FIREWORKS_BASE_URL else None
 
 
 def _max_tokens() -> int:
@@ -141,35 +151,50 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
         {"role": "system", "content": "You answer with a single JSON object and nothing else."},
         {"role": "user", "content": prompt},
     ]
-    last_rejection: Optional[str] = None
-    with _client() as client:
-        for fmt in _response_formats(schema):
-            body = {"model": model, "messages": messages, "temperature": 0.2, "stream": False,
-                    "max_tokens": _max_tokens()}
-            if fmt is not None:
-                body["response_format"] = fmt
-            resp = client.post(url, json=body, headers=_headers())
-            if fmt is not None and _is_format_rejection(resp):
-                # The server does not know this response_format flavour; the
-                # next loop iteration asks for a looser one.
-                last_rejection = resp.text[:200]
-                continue
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
-            data = resp.json()
-            break
-        else:
-            raise RuntimeError(
-                f"LLM server rejected every response_format variant: {last_rejection}")
+    def _request(effort):
+        last_rejection: Optional[str] = None
+        with _client() as client:
+            for fmt in _response_formats(schema):
+                body = {"model": model, "messages": messages, "temperature": 0.2,
+                        "stream": False, "max_tokens": _max_tokens()}
+                if effort:
+                    body["reasoning_effort"] = effort
+                if fmt is not None:
+                    body["response_format"] = fmt
+                resp = client.post(url, json=body, headers=_headers())
+                if fmt is not None and _is_format_rejection(resp):
+                    # The server does not know this response_format flavour; the
+                    # next loop iteration asks for a looser one.
+                    last_rejection = resp.text[:200]
+                    continue
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
+                return resp.json()
+        raise RuntimeError(
+            f"LLM server rejected every response_format variant: {last_rejection}")
 
-    choices = data.get("choices") or []
-    text = ""
-    if choices:
+    def _content(data):
+        choices = data.get("choices") or []
+        if not choices:
+            return "", None
         msg = choices[0].get("message") or {}
         text = msg.get("content") or ""
         if isinstance(text, list):  # some servers return content parts
             text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+        return text, choices[0].get("finish_reason")
+
+    effort = _reasoning_effort()
+    data = _request(effort)
+    text, finish = _content(data)
+    if finish == "length" and effort != "none":
+        # Ran out of output budget (usually on reasoning) before finishing the
+        # JSON: ask once more with reasoning off rather than fail the stage.
+        print(f"⚠️ LLM hit max_tokens (reasoning_effort={effort}); retrying with reasoning off")
+        data = _request("none")
+        text, finish = _content(data)
+    if not text.strip():
+        raise ValueError(f"Gemini returned an empty response body. (finish_reason={finish})")
     parsed = gemini_worker._parse_json_response_text(text)
     # Validate against the same schema Gemini enforces server-side, so a
     # local model that drops a field fails here with a readable error
