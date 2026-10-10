@@ -30,9 +30,11 @@ from typing import Optional, Tuple, Type
 import httpx
 from pydantic import BaseModel
 
-# Broker Marketplace runs the moment picker on Claude Haiku 5.5 through the
-# Broker Marketplace LLM gateway first (LLM_GATEWAY_API_KEY switches it on),
-# then DeepSeek V4.1 Flash via Fireworks (FIREWORKS_API_KEY), then Gemini.
+# Broker Marketplace runs the moment picker on DeepSeek V4.1 Flash via
+# Fireworks first (FIREWORKS_API_KEY), then Claude Haiku 5.5 through the
+# Broker Marketplace LLM gateway (LLM_GATEWAY_API_KEY), then Gemini. Haiku-first
+# was tried 2026-10-09 and picked fewer, more clustered, weaker clips than
+# DeepSeek on the same episode (7 vs 11-12).
 # LLM_BASE_URL / LLM_MODEL / LLM_API_KEY still override the Fireworks lane.
 GATEWAY_DEFAULT_URL = "https://llm.broker-marketplace.com/v1"
 GATEWAY_DEFAULT_MODEL = "claude-code/claude-haiku-5-5-medium"
@@ -71,14 +73,14 @@ def gateway_endpoint() -> Optional[dict]:
 
 def llm_lanes() -> list:
     """OpenAI-compatible clip-picker lanes in order, as ``("llm", model,
-    endpoint)``: the gateway's Claude Haiku 5.5, then DeepSeek (Fireworks or
-    LLM_BASE_URL). main.py appends Gemini after these."""
+    endpoint)``: DeepSeek (Fireworks or LLM_BASE_URL), then the gateway's
+    Claude Haiku 5.5. main.py appends Gemini after these."""
     lanes = []
+    if active():
+        lanes.append(("llm", model_name(), None))
     gateway = gateway_endpoint()
     if gateway:
         lanes.append(("llm", gateway["model"], gateway))
-    if active():
-        lanes.append(("llm", model_name(), None))
     return lanes
 
 

@@ -1358,8 +1358,8 @@ def _select_clips_with(lane, transcript_result, video_duration):
 
 
 def get_viral_clips(transcript_result, video_duration):
-    """Pick clips from the transcript: Claude Haiku 5.5 (gateway) first, then
-    DeepSeek, then Gemini.
+    """Pick clips from the transcript: DeepSeek first, then Claude Haiku 5.5
+    (gateway), then Gemini.
     Returns {"shorts": [...], "cost_analysis": {...}} or None."""
     lanes = _selection_lanes()
     if not lanes:
