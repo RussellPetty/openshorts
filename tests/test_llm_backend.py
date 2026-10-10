@@ -140,3 +140,54 @@ def test_stage_routes_to_local_backend_and_retries_transient(local, monkeypatch)
     assert cost["total_cost"] == 0.0
 
 
+
+
+# --- Broker Marketplace gateway lane (Claude Haiku 5.5 first) ----------------
+
+def test_gateway_lane_off_without_key(monkeypatch):
+    monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    assert llm_backend.gateway_endpoint() is None
+
+
+def test_gateway_lane_posts_haiku_in_ask_mode_without_reasoning_effort(monkeypatch):
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "gw-key")
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_MODEL", raising=False)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")  # would add reasoning_effort=low on Fireworks
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        seen["auth"] = request.headers.get("authorization")
+        return _completion({"windows": [{"id": "w0", "start": 0, "end": 90, "score": 88, "reason": "hook"}]})
+
+    _serve(handler, monkeypatch)
+    endpoint = llm_backend.gateway_endpoint()
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse, endpoint=endpoint)
+    assert parsed["windows"][0]["id"] == "w0"
+    assert seen["url"] == "https://llm.broker-marketplace.com/v1/chat/completions"
+    assert seen["auth"] == "Bearer gw-key"
+    assert seen["body"]["model"] == "claude-code/claude-haiku-5-5-medium"
+    assert seen["body"]["mode"] == "ask"
+    assert "reasoning_effort" not in seen["body"]
+
+
+def test_llm_lanes_are_haiku_then_deepseek(monkeypatch):
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "gw-key")
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    lanes = llm_backend.llm_lanes()
+    assert [lane[1] for lane in lanes] == [
+        "claude-code/claude-haiku-5-5-medium", "accounts/fireworks/models/deepseek-v4p1-flash"]
+    assert lanes[0][2]["gateway"] is True and lanes[1][2] is None
+
+
+def test_llm_lanes_without_gateway_key_is_deepseek_only(monkeypatch):
+    monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    assert [lane[1] for lane in llm_backend.llm_lanes()] == ["accounts/fireworks/models/deepseek-v4p1-flash"]

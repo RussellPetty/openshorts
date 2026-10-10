@@ -1181,7 +1181,8 @@ def _run_llm_stage(lane, prompt, schema):
     for attempt in range(1, max_attempts + 1):
         try:
             if lane[0] == "llm":
-                return llm_backend.generate_json(prompt, schema, model=lane[1])
+                return llm_backend.generate_json(
+                    prompt, schema, model=lane[1], endpoint=lane[2] if len(lane) > 2 else None)
             client, model_name = lane[1], lane[2]
             config = genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -1249,9 +1250,7 @@ def score_batch_size():
 
 
 def _selection_lanes():
-    lanes = []
-    if llm_backend.active():
-        lanes.append(("llm", llm_backend.model_name()))
+    lanes = llm_backend.llm_lanes()
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         lanes.append(("gemini", genai.Client(api_key=api_key), _gemini_model_name()))
@@ -1259,7 +1258,10 @@ def _selection_lanes():
 
 
 def _lane_label(lane):
-    return f"{lane[1]} @ {llm_backend.base_url()}" if lane[0] == "llm" else lane[2]
+    if lane[0] != "llm":
+        return lane[2]
+    base = lane[2]["base_url"] if len(lane) > 2 and lane[2] else llm_backend.base_url()
+    return f"{lane[1]} @ {base}"
 
 
 def _select_clips_with(lane, transcript_result, video_duration):
@@ -1356,7 +1358,8 @@ def _select_clips_with(lane, transcript_result, video_duration):
 
 
 def get_viral_clips(transcript_result, video_duration):
-    """Pick clips from the transcript: DeepSeek first, Gemini as fallback.
+    """Pick clips from the transcript: Claude Haiku 5.5 (gateway) first, then
+    DeepSeek, then Gemini.
     Returns {"shorts": [...], "cost_analysis": {...}} or None."""
     lanes = _selection_lanes()
     if not lanes:

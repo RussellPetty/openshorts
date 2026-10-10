@@ -30,9 +30,12 @@ from typing import Optional, Tuple, Type
 import httpx
 from pydantic import BaseModel
 
-# Broker Marketplace runs the moment picker on DeepSeek V4.1 Flash via
-# Fireworks: setting FIREWORKS_API_KEY alone is enough to switch it on, and
-# LLM_BASE_URL / LLM_MODEL / LLM_API_KEY still override it for anything else.
+# Broker Marketplace runs the moment picker on Claude Haiku 5.5 through the
+# Broker Marketplace LLM gateway first (LLM_GATEWAY_API_KEY switches it on),
+# then DeepSeek V4.1 Flash via Fireworks (FIREWORKS_API_KEY), then Gemini.
+# LLM_BASE_URL / LLM_MODEL / LLM_API_KEY still override the Fireworks lane.
+GATEWAY_DEFAULT_URL = "https://llm.broker-marketplace.com/v1"
+GATEWAY_DEFAULT_MODEL = "claude-code/claude-haiku-5-5-medium"
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
 FIREWORKS_DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 DEFAULT_MODEL = "llama3.1:8b"
@@ -48,6 +51,35 @@ def provider() -> str:
     if explicit == "gemini":
         return "gemini"
     return "openai" if base_url() else "gemini"
+
+
+def gateway_endpoint() -> Optional[dict]:
+    """The Broker Marketplace gateway lane (Claude Haiku 5.5), or None when
+    LLM_GATEWAY_API_KEY is unset. Effort rides in the model id's tier, so this
+    lane never sends reasoning_effort, and ``mode: ask`` keeps Claude Code a
+    plain LLM (no tools)."""
+    key = (os.environ.get("LLM_GATEWAY_API_KEY") or "").strip()
+    if not key:
+        return None
+    return {
+        "base_url": (os.environ.get("LLM_GATEWAY_URL") or GATEWAY_DEFAULT_URL).strip().rstrip("/"),
+        "api_key": key,
+        "model": (os.environ.get("LLM_GATEWAY_MODEL") or GATEWAY_DEFAULT_MODEL).strip(),
+        "gateway": True,
+    }
+
+
+def llm_lanes() -> list:
+    """OpenAI-compatible clip-picker lanes in order, as ``("llm", model,
+    endpoint)``: the gateway's Claude Haiku 5.5, then DeepSeek (Fireworks or
+    LLM_BASE_URL). main.py appends Gemini after these."""
+    lanes = []
+    gateway = gateway_endpoint()
+    if gateway:
+        lanes.append(("llm", gateway["model"], gateway))
+    if active():
+        lanes.append(("llm", model_name(), None))
+    return lanes
 
 
 def _fireworks_key() -> str:
@@ -135,7 +167,7 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
 
 
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
-                  ) -> Tuple[dict, Optional[dict]]:
+                  endpoint: Optional[dict] = None) -> Tuple[dict, Optional[dict]]:
     """One chat completion that must come back as JSON matching ``schema``.
 
     Returns ``(parsed_dict, cost_analysis)`` in the exact shape
@@ -145,8 +177,11 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     """
     import gemini_worker  # local import: keeps this module free of the google SDK
 
-    url = f"{base_url()}/chat/completions"
-    model = model or model_name()
+    gateway = bool(endpoint and endpoint.get("gateway"))
+    url = f"{(endpoint or {}).get('base_url') or base_url()}/chat/completions"
+    model = model or (endpoint or {}).get("model") or model_name()
+    headers = ({"Authorization": f"Bearer {endpoint['api_key']}", "Content-Type": "application/json"}
+               if endpoint else _headers())
     messages = [
         {"role": "system", "content": "You answer with a single JSON object and nothing else."},
         {"role": "user", "content": prompt},
@@ -157,11 +192,13 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
             for fmt in _response_formats(schema):
                 body = {"model": model, "messages": messages, "temperature": 0.2,
                         "stream": False, "max_tokens": _max_tokens()}
-                if effort:
+                if effort and not gateway:
                     body["reasoning_effort"] = effort
+                if gateway:
+                    body["mode"] = "ask"
                 if fmt is not None:
                     body["response_format"] = fmt
-                resp = client.post(url, json=body, headers=_headers())
+                resp = client.post(url, json=body, headers=headers)
                 if fmt is not None and _is_format_rejection(resp):
                     # The server does not know this response_format flavour; the
                     # next loop iteration asks for a looser one.
@@ -184,10 +221,10 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
             text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
         return text, choices[0].get("finish_reason")
 
-    effort = _reasoning_effort()
+    effort = None if gateway else _reasoning_effort()
     data = _request(effort)
     text, finish = _content(data)
-    if finish == "length" and effort != "none":
+    if finish == "length" and effort and effort != "none":
         # Ran out of output budget (usually on reasoning) before finishing the
         # JSON: ask once more with reasoning off rather than fail the stage.
         print(f"⚠️ LLM hit max_tokens (reasoning_effort={effort}); retrying with reasoning off")
