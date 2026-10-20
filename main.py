@@ -1156,8 +1156,8 @@ def transcribe_video(video_path):
 
 
 # --- Clip selection (upstream 2-pass: score windows -> detail shortlist) ----
-# Primary model: DeepSeek V4.1 Flash on Fireworks via llm_backend (switched on
-# by FIREWORKS_API_KEY). Gemini is the fallback when that lane fails, and the
+# Primary model: DeepSeek V4.1 Flash on Baseten via llm_backend (switched on
+# by BASETEN_API_KEY). Gemini is the fallback when that lane fails, and the
 # only option for the silent-video vision path.
 
 _TRANSIENT_TOKENS = (
@@ -1364,7 +1364,7 @@ def get_viral_clips(transcript_result, video_duration):
     lanes = _selection_lanes()
     if not lanes:
         print("❌ Error: no clip-selection model configured "
-              "(set FIREWORKS_API_KEY or GEMINI_API_KEY).")
+              "(set BASETEN_API_KEY or GEMINI_API_KEY).")
         return None
 
     print(f"🤖  Analyzing transcript (2-pass: score → detail), language: "

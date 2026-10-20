@@ -153,7 +153,7 @@ def test_gateway_lane_posts_haiku_in_ask_mode_without_reasoning_effort(monkeypat
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "gw-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_MODEL", raising=False)
-    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")  # would add reasoning_effort=low on Fireworks
+    monkeypatch.setenv("BASETEN_API_KEY", "bt-key")  # would add reasoning_effort=low on Baseten
     seen = {}
 
     def handler(request):
@@ -175,19 +175,19 @@ def test_gateway_lane_posts_haiku_in_ask_mode_without_reasoning_effort(monkeypat
 
 def test_llm_lanes_are_deepseek_then_haiku(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "gw-key")
-    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.setenv("BASETEN_API_KEY", "bt-key")
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     lanes = llm_backend.llm_lanes()
     assert [lane[1] for lane in lanes] == [
-        "accounts/fireworks/models/deepseek-v4p1-flash", "claude-code/claude-haiku-5-5-medium"]
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast", "claude-code/claude-haiku-5-5-medium"]
     assert lanes[0][2] is None and lanes[1][2]["gateway"] is True
 
 
 def test_llm_lanes_without_gateway_key_is_deepseek_only(monkeypatch):
     monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
-    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.setenv("BASETEN_API_KEY", "bt-key")
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    assert [lane[1] for lane in llm_backend.llm_lanes()] == ["accounts/fireworks/models/deepseek-v4p1-flash"]
+    assert [lane[1] for lane in llm_backend.llm_lanes()] == ["deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"]

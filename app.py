@@ -415,10 +415,10 @@ async def process_v2(
 
     # Get API key from header, fall back to environment variable
     api_key = request.headers.get("X-Gemini-Key") or os.environ.get("GEMINI_API_KEY")
-    if not api_key and not os.environ.get("FIREWORKS_API_KEY") and not os.environ.get("LLM_BASE_URL"):
+    if not api_key and not os.environ.get("BASETEN_API_KEY") and not os.environ.get("LLM_BASE_URL"):
         raise HTTPException(
             status_code=400,
-            detail="No clip-selection model configured. Set FIREWORKS_API_KEY or GEMINI_API_KEY, or send X-Gemini-Key."
+            detail="No clip-selection model configured. Set BASETEN_API_KEY or GEMINI_API_KEY, or send X-Gemini-Key."
         )
 
     # Validate caption style

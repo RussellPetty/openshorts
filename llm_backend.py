@@ -31,15 +31,15 @@ import httpx
 from pydantic import BaseModel
 
 # Broker Marketplace runs the moment picker on DeepSeek V4.1 Flash via
-# Fireworks first (FIREWORKS_API_KEY), then Claude Haiku 5.5 through the
+# Baseten Fast first (BASETEN_API_KEY), then Claude Haiku 5.5 through the
 # Broker Marketplace LLM gateway (LLM_GATEWAY_API_KEY), then Gemini. Haiku-first
 # was tried 2026-10-09 and picked fewer, more clustered, weaker clips than
 # DeepSeek on the same episode (7 vs 11-12).
-# LLM_BASE_URL / LLM_MODEL / LLM_API_KEY still override the Fireworks lane.
+# LLM_BASE_URL / LLM_MODEL / LLM_API_KEY still override the Baseten lane.
 GATEWAY_DEFAULT_URL = "https://llm.broker-marketplace.com/v1"
 GATEWAY_DEFAULT_MODEL = "claude-code/claude-haiku-5-5-medium"
-FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
-FIREWORKS_DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
+BASETEN_BASE_URL = "https://inference.baseten.co/v1"
+BASETEN_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"
 DEFAULT_MODEL = "llama3.1:8b"
 DEFAULT_MAX_TOKENS = 32000
 DEFAULT_TIMEOUT = 600.0  # local models on CPU are slow; a scoring batch can take minutes
@@ -73,7 +73,7 @@ def gateway_endpoint() -> Optional[dict]:
 
 def llm_lanes() -> list:
     """OpenAI-compatible clip-picker lanes in order, as ``("llm", model,
-    endpoint)``: DeepSeek (Fireworks or LLM_BASE_URL), then the gateway's
+    endpoint)``: DeepSeek (Baseten or LLM_BASE_URL), then the gateway's
     Claude Haiku 5.5. main.py appends Gemini after these."""
     lanes = []
     if active():
@@ -84,34 +84,34 @@ def llm_lanes() -> list:
     return lanes
 
 
-def _fireworks_key() -> str:
-    return (os.environ.get("FIREWORKS_API_KEY") or "").strip()
+def _baseten_key() -> str:
+    return (os.environ.get("BASETEN_API_KEY") or "").strip()
 
 
 def base_url() -> str:
     explicit = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/")
     if explicit:
         return explicit
-    return FIREWORKS_BASE_URL if _fireworks_key() else ""
+    return BASETEN_BASE_URL if _baseten_key() else ""
 
 
 def model_name() -> str:
     explicit = (os.environ.get("LLM_MODEL") or "").strip()
     if explicit:
         return explicit
-    if base_url() == FIREWORKS_BASE_URL:
-        return FIREWORKS_DEFAULT_MODEL
+    if base_url() == BASETEN_BASE_URL:
+        return BASETEN_DEFAULT_MODEL
     return DEFAULT_MODEL
 
 
 def _reasoning_effort() -> Optional[str]:
     """``LLM_REASONING_EFFORT`` (none|low|medium|high), default "low" on
-    Fireworks. Unbounded reasoning on the detail pass spent the whole output
+    Baseten. Unbounded reasoning on the detail pass spent the whole output
     budget thinking and returned an empty body (prod, 5-oct-2026)."""
     raw = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
     if raw:
         return None if raw == "default" else raw
-    return "low" if base_url() == FIREWORKS_BASE_URL else None
+    return "low" if base_url() == BASETEN_BASE_URL else None
 
 
 def _max_tokens() -> int:
@@ -143,7 +143,7 @@ def _timeout() -> float:
 def _headers() -> dict:
     # Ollama ignores the key but the OpenAI client convention (and vLLM with
     # --api-key) wants the header present; "ollama" is the documented placeholder.
-    key = (os.environ.get("LLM_API_KEY") or _fireworks_key() or "ollama").strip()
+    key = (os.environ.get("LLM_API_KEY") or _baseten_key() or "ollama").strip()
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
