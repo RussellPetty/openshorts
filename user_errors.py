@@ -39,6 +39,10 @@ _RULES = [
     ("LINK_NOT_FOUND",
      ("http error 404", "404: not found", "http error 410"),
      "The video link no longer exists (404). Check the link and try again."),
+    ("FILE_TOO_LARGE",
+     ("file too large",),
+     "This video file is over the size limit we can process. Try a shorter "
+     "video or a lower-resolution export."),
     ("NOT_A_VIDEO",
      ("downloaded file too small", "invalid data found when processing input",
       "moov atom not found", "could not open video file", "input file not found",

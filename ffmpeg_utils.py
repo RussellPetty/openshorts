@@ -85,11 +85,43 @@ METADATA_SCRUB = ["-map_metadata", "-1", "-map_chapters", "-1",
 LOUDNORM_FILTER = "loudnorm=I=-14:TP=-2.0:LRA=11"
 
 
-def audio_encode_args():
-    """AAC encode args for a delivered clip, with loudness normalisation."""
-    args = ["-c:a", "aac"]
+def cut_fade_seconds():
+    """Length of the fade-in/out at each clip cut (CUT_AUDIO_FADE_MS, default
+    8ms; 0 disables). Even a cut placed in the quietest 10ms of a gap can land
+    on a non-zero sample, which plays as a click; 8ms is far too short to hear
+    as a fade."""
+    try:
+        ms = float(os.environ.get("CUT_AUDIO_FADE_MS", "8"))
+    except ValueError:
+        ms = 8.0
+    return max(0.0, min(ms, 100.0)) / 1000.0
+
+
+def audio_fade_filters(clip_duration, fade=None):
+    """afade in/out filters for a clip of ``clip_duration`` seconds ([] when off)."""
+    fade = cut_fade_seconds() if fade is None else max(0.0, float(fade))
+    try:
+        clip_duration = float(clip_duration)
+    except (TypeError, ValueError):
+        return []
+    if fade <= 0 or clip_duration <= 4 * fade:
+        return []
+    return [f"afade=t=in:st=0:d={fade:.3f}",
+            f"afade=t=out:st={clip_duration - fade:.3f}:d={fade:.3f}"]
+
+
+def audio_encode_args(clip_duration=None):
+    """AAC encode args for a delivered clip, with loudness normalisation and,
+    when ``clip_duration`` is given, click-free fades at both cut points
+    (applied after loudnorm so normalisation cannot undo them)."""
+    filters = []
     if os.environ.get("AUDIO_NORMALIZE", "1").strip() != "0":
-        args = ["-af", LOUDNORM_FILTER] + args
+        filters.append(LOUDNORM_FILTER)
+    if clip_duration is not None:
+        filters.extend(audio_fade_filters(clip_duration))
+    args = ["-c:a", "aac"]
+    if filters:
+        args = ["-af", ",".join(filters)] + args
     return args
 
 _probe_lock = threading.Lock()
@@ -262,13 +294,17 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
     session cannot allocate on a GPU that other jobs are filling.
     """
     encode_args = video_encode_args(QUALITY_FAST)
+    try:
+        clip_duration = max(0.0, float(end) - float(start))
+    except (TypeError, ValueError):
+        clip_duration = None
     command = [
         'ffmpeg', '-y',
         '-ss', str(start),
         '-to', str(end),
         '-i', input_video,
         *encode_args,
-        *audio_encode_args(),
+        *audio_encode_args(clip_duration),
         clip_temp_path
     ]
     gpu_command = None
@@ -281,7 +317,7 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
             del gpu_args[i:i + 2]
         gpu_command = ['ffmpeg', '-y', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
                        '-ss', str(start), '-to', str(end), '-i', input_video,
-                       *gpu_args, *audio_encode_args(), clip_temp_path]
+                       *gpu_args, *audio_encode_args(clip_duration), clip_temp_path]
 
     def _run_one(cmd):
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL,

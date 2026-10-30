@@ -15,7 +15,7 @@ from google.genai import types as genai_types
 from pydantic import BaseModel
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
-                            lookup_model_prices)
+                            lookup_model_prices, shortlist_target)
 
 load_dotenv()
 
@@ -90,6 +90,28 @@ and an Instagram description, and a YouTube title ≤100 chars). Order clips bes
 to worst by how likely they are to stop a viewer scrolling.
 """
 
+def build_visual_prompt(video_duration, language="en", min_clips=None, max_clips=None,
+                        min_secs=None, max_secs=None):
+    """VISUAL_PROMPT_TEMPLATE filled with every placeholder it needs.
+
+    main.get_visual_clips used to pass only video_duration and language, so
+    the .format() raised KeyError('min_clips') on EVERY silent/low-speech
+    video and the job fell back to "the first 60 seconds"."""
+    lo_secs, hi_secs = clip_duration_bounds()
+    if min_secs is None:
+        min_secs = lo_secs
+    if max_secs is None:
+        max_secs = hi_secs
+    if min_clips is None or max_clips is None:
+        lo, hi = clip_count_targets(shortlist_target(video_duration))
+        min_clips = lo if min_clips is None else min_clips
+        max_clips = hi if max_clips is None else max_clips
+    return VISUAL_PROMPT_TEMPLATE.format(
+        video_duration=video_duration, language=language or "en",
+        min_clips=min_clips, max_clips=max(min_clips, max_clips),
+        min_secs=float(min_secs), max_secs=float(max_secs))
+
+
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
 RANK these candidate windows by how well each would work as a standalone short.
@@ -136,11 +158,35 @@ CLIP RULES:
 - Return only valid JSON.
 - Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
 - Stay within the candidate window boundaries.
+- TIMED TRANSCRIPT: each window's `transcript` has one line per sentence,
+  "START-END text" in absolute seconds. Lines beginning with "~" continue the
+  sentence above them. Set `start` to the START of a line that does NOT begin
+  with "~", and `end` to the END of a line that finishes a sentence. Never
+  invent a time between those numbers: a cut inside a line is a cut mid-sentence.
 - THE 2-SECOND RULE: the clip MUST open on its strongest moment. If the first
   2 seconds would not stop a cold viewer from scrolling, move the start or skip the clip.
-- Start slightly before the hook and end slightly after the payoff when possible.
-- Do not cut in the middle of a word or phrase.
 - No generic intros/outros unless they are the hook.
+
+OPEN / END / SHAPE — measured on hundreds of finished reels matched back to
+their long-form source (how much likelier each choice was to reach the top
+quartile of views):
+- OPEN ON (best first): the payoff itself, skipping the setup (1.7x); a
+  striking number or extreme stat (1.4x); the speaker naming the viewer's exact
+  situation, "if you have less than $100K..." (1.3x). A bold claim or an
+  anecdote alone is neutral.
+- NEVER OPEN ON A LITERAL QUESTION (0.2x — the single worst opener). If the best
+  line is phrased as a question, start on the sentence that states the claim or
+  answer it implies instead.
+- END ON (best first): the punchline or emotional peak (1.6x); a complete, strong
+  sentence (1.4x); a short command that resolves the point (1.3x). A tidy maxim
+  is no edge — land on the PEAK.
+- NEVER END RIGHT BEFORE THE EXPLANATION (0.35x — the worst ending): if the next
+  line is "the reason that works is..." / "here's why...", either include the
+  explanation or end on an earlier complete beat. Never end on "and", "but",
+  "so", "because", "the" or any word that leaves the sentence hanging.
+- SHAPE: prefer one continuous stretch where only the preamble before the hook
+  is dropped (1.5x). A moment that only works with lots of interior cuts
+  (0.7x) is the wrong moment — pick a cleaner stretch.
 - STANDS ALONE: the clip must make sense to someone who has seen nothing else.
   If it opens on a pronoun, a "that", a "so anyway", or an answer whose question
   was asked earlier, move the start back to where the idea begins or skip it.
@@ -160,7 +206,7 @@ CLIP RULES:
   as long as each lands its own moment.
 
 HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 10 words):
-- Open question: "Why does everyone get this wrong?"
+- Open question (overlay text only — the clip itself must not open on one): "Why does everyone get this wrong?"
 - Hot take / controversy: "Stop doing this. Seriously."
 - Number / fact shock: "97% of people miss this."
 - Story loop: "This one email almost ruined me."
@@ -182,7 +228,7 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
-CANDIDATE_WINDOWS_JSON:
+CANDIDATE_WINDOWS_JSON (id, start, end, timed transcript):
 {windows_json}
 
 Return only:

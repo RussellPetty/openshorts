@@ -139,6 +139,12 @@ USER appuser
 # Pre-download YOLO model on build (now running as appuser)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
+# Pre-download the default faster-whisper model ("small", ~460MB int8 —
+# transcription.DEFAULT_WHISPER_MODEL) so the first job after a deploy does not
+# stall on the download. A WHISPER_MODEL override still downloads at runtime.
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" \
+    || echo "[build] whisper model pre-download failed; will download on first job"
+
 # Pre-download the CloakBrowser stealth Chromium (~200MB) at build time so the
 # first /api/transcribe request doesn't stall on it — and a runtime network blip
 # can't break the download path. Cached under appuser's writable /app home.
@@ -149,10 +155,10 @@ RUN python -m cloakbrowser install \
 # Expose FastAPI port
 EXPOSE 8000
 
-# Container start: launches the bgutil POT server in the background, waits
-# for /ping (or surfaces the crash log if it dies), upgrades yt-dlp, then
-# execs uvicorn. yt-dlp's bgutil plugin auto-detects 127.0.0.1:4416.
+# Container start: starts Xvfb for CloakBrowser, then execs uvicorn.
 # `exec` keeps uvicorn as PID 1 so SIGTERM still shuts the container down.
+# (The bgutil POT server copied above is no longer launched — it only served
+# the unreachable yt-dlp path; the stage can be dropped in a later cleanup.)
 # start.sh came in via `COPY . .` above; we already chowned /app to appuser.
 USER root
 RUN chmod +x /app/start.sh

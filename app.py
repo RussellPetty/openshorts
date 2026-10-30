@@ -41,8 +41,20 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 500  # 500 MB limit
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+def _env_int(name, default):
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+MAX_FILE_SIZE_MB = _env_int("MAX_FILE_SIZE_MB", 500)  # also enforced by main.py downloads
+# output/<job_id> (clips, metadata, any leftover source) is deleted this long
+# after its last write. The Redis job record expires after 24h on its own.
+JOB_RETENTION_SECONDS = _env_int("JOB_RETENTION_SECONDS", 48 * 3600)
+JOB_CLEANUP_INTERVAL_SECONDS = _env_int("JOB_CLEANUP_INTERVAL_SECONDS", 1800)
+# A job whose main.py is still running after this is killed and failed.
+JOB_TIMEOUT_SECONDS = _env_int("JOB_TIMEOUT_SECONDS", 3 * 3600)
 # Reject sources shorter than this before starting (0 disables). A 24s Short
 # cannot yield 15-60s clips; main.py enforces the same floor after download
 # for YouTube links, which cannot be probed here.
@@ -62,6 +74,100 @@ RENDER_FAILED_MESSAGE = ("We picked clips from this video but couldn't render an
 # User-facing failure reason per job, from main.py's "❌ CODE: message" lines.
 job_fail_reasons: Dict[str, str] = {}
 _FAIL_LINE = re.compile(r"❌ ([A-Z_]{3,}): (.+)")
+
+TIMEOUT_MESSAGE = ("This video took too long to process and the job was stopped. "
+                   "Try a shorter video, or try again later.")
+# Jobs whose main.py is running right now (never swept by the cleanup loop).
+active_job_ids: set = set()
+_CLIP_FILE_RE = re.compile(r"_clip_\d+(?:_[A-Za-z0-9]+)*\.mp4$")
+
+
+def _newest_mtime(path: str) -> float:
+    newest = os.path.getmtime(path)
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                pass
+    return newest
+
+
+def sweep_expired_outputs(now: Optional[float] = None, retention: Optional[int] = None,
+                          base_dirs=(OUTPUT_DIR, UPLOAD_DIR), active=None) -> int:
+    """Delete job dirs / uploads untouched for ``retention`` seconds.
+    Returns how many entries were removed. Active jobs are never touched."""
+    now = time.time() if now is None else now
+    retention = JOB_RETENTION_SECONDS if retention is None else retention
+    active = active_job_ids if active is None else active
+    removed = 0
+    for base in base_dirs:
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for name in entries:
+            if name in active:
+                continue
+            path = os.path.join(base, name)
+            try:
+                age = now - (_newest_mtime(path) if os.path.isdir(path) else os.path.getmtime(path))
+                if age < retention:
+                    continue
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed += 1
+            except OSError as e:
+                print(f"⚠️ Cleanup could not remove {path}: {e}")
+    return removed
+
+
+async def cleanup_loop():
+    """Periodic retention sweep (JOB_RETENTION_SECONDS, default 48h)."""
+    while True:
+        try:
+            removed = await asyncio.to_thread(sweep_expired_outputs)
+            if removed:
+                print(f"🧹 Removed {removed} expired job output(s)")
+        except Exception as e:
+            print(f"⚠️ Output cleanup failed: {e}")
+        await asyncio.sleep(max(60, JOB_CLEANUP_INTERVAL_SECONDS))
+
+
+def remove_job_leftovers(output_dir: str) -> None:
+    """After a FAILED job: delete everything except published clips (the
+    downloaded source, half-rendered temp files). Published clips stay until
+    the retention sweep, in case partial results were already handed out."""
+    try:
+        names = os.listdir(output_dir)
+    except OSError:
+        return
+    for name in names:
+        if _CLIP_FILE_RE.search(name) and not name.startswith((".", "temp_", "captioned_")):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _kill_process_tree(process) -> None:
+    """main.py runs in its own session; take its ffmpeg children down with it."""
+    import signal
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
 
 INTERRUPTED_MESSAGE = ("This job was interrupted by a server restart before it finished. "
                        "Please submit the video again.")
@@ -93,6 +199,7 @@ async def lifespan(app: FastAPI):
     # Start v2 worker if Redis available
     redis = await get_redis()
     v2_worker_task = None
+    cleanup_task = asyncio.create_task(cleanup_loop())
     if redis:
         await fail_orphaned_jobs(RedisJobStore(redis))
         v2_worker_task = asyncio.create_task(process_queue_v2())
@@ -103,6 +210,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    cleanup_task.cancel()
     await close_redis()
 
 app = FastAPI(lifespan=lifespan)
@@ -189,7 +297,9 @@ def parse_progress(log_line: str) -> Optional[Tuple[int, str]]:
         return (50, "AI analysis")
     if "processing clip" in line_lower or "extracting" in line_lower:
         return (70, "Creating clips")
-    if "clip saved" in line_lower or "saved to" in line_lower:
+    # Only a finished clip means "finalizing" — a bare "saved to" also matched
+    # main.py's "Saved metadata to" line, which is printed BEFORE any render.
+    if "clip saved to" in line_lower or re.search(r"\bclip \d+ ready\b", line_lower):
         return (90, "Finalizing")
     return None
 
@@ -222,6 +332,38 @@ def enqueue_output_v2(out, job_id: str, store: RedisJobStore, loop):
         out.close()
 
 
+def _int_or_none(value):
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def clip_result_from_metadata(job_id: str, clip_filename: str, clip: dict) -> ClipResult:
+    """One API ClipResult from a metadata.json ``shorts`` entry."""
+    title = clip.get('video_title_for_youtube_short')
+    # The selector writes no separate YouTube description; the title alone
+    # made a poor one. Prefer a real description when one exists.
+    youtube_desc = (clip.get('video_description_for_youtube')
+                    or clip.get('video_description_for_instagram')
+                    or clip.get('video_description_for_tiktok')
+                    or title)
+    qa = clip.get('qa')
+    return ClipResult(
+        video_url=build_video_url(job_id, clip_filename),
+        title=title,
+        description_tiktok=clip.get('video_description_for_tiktok'),
+        description_instagram=clip.get('video_description_for_instagram'),
+        description_youtube=youtube_desc,
+        start=clip.get('start'),
+        end=clip.get('end'),
+        viral_hook_text=clip.get('viral_hook_text') or None,
+        predicted_score=_int_or_none(clip.get('predicted_score')),
+        why=clip.get('why') or None,
+        qa=qa if isinstance(qa, dict) else None,
+    )
+
+
 async def check_partial_results_v2(job_id: str, output_dir: str, store: RedisJobStore):
     """Check for partial results during processing."""
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
@@ -244,15 +386,7 @@ async def check_partial_results_v2(job_id: str, output_dir: str, store: RedisJob
             clip_filename = f"{base_name}_clip_{i+1}.mp4"
             clip_path = os.path.join(output_dir, clip_filename)
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                ready_clips.append(ClipResult(
-                    video_url=build_video_url(job_id, clip_filename),
-                    title=clip.get('video_title_for_youtube_short'),
-                    description_tiktok=clip.get('video_description_for_tiktok'),
-                    description_instagram=clip.get('video_description_for_instagram'),
-                    description_youtube=clip.get('video_title_for_youtube_short'),
-                    start=clip.get('start'),
-                    end=clip.get('end')
-                ))
+                ready_clips.append(clip_result_from_metadata(job_id, clip_filename, clip))
 
         if ready_clips:
             await store.set_result(job_id, JobResult(clips=ready_clips))
@@ -279,15 +413,7 @@ async def finalize_job_v2(job_id: str, output_dir: str, store: RedisJobStore):
             # hand the caller a URL that 404s.
             if not os.path.exists(clip_path) or os.path.getsize(clip_path) == 0:
                 continue
-            result_clips.append(ClipResult(
-                video_url=build_video_url(job_id, clip_filename),
-                title=clip.get('video_title_for_youtube_short'),
-                description_tiktok=clip.get('video_description_for_tiktok'),
-                description_instagram=clip.get('video_description_for_instagram'),
-                description_youtube=clip.get('video_title_for_youtube_short'),
-                start=clip.get('start'),
-                end=clip.get('end')
-            ))
+            result_clips.append(clip_result_from_metadata(job_id, clip_filename, clip))
 
         if not result_clips:
             await store.set_status(job_id, JobStatus.FAILED, RENDER_FAILED_MESSAGE)
@@ -329,12 +455,14 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
         env["GEMINI_API_KEY"] = job_api_keys[job_id]
 
     try:
+        active_job_ids.add(job_id)
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            start_new_session=True,  # own process group, so a timeout kills ffmpeg too
         )
 
         # Log reader thread
@@ -347,12 +475,24 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
         t_log.start()
 
         # Wait for completion with incremental updates
+        started = time.monotonic()
+        timed_out = False
         while process.poll() is None:
             await asyncio.sleep(2)
+            if JOB_TIMEOUT_SECONDS > 0 and time.monotonic() - started > JOB_TIMEOUT_SECONDS:
+                print(f"v2 Job {job_id} exceeded JOB_TIMEOUT_SECONDS={JOB_TIMEOUT_SECONDS}; killing it")
+                _kill_process_tree(process)
+                await asyncio.to_thread(process.wait)
+                timed_out = True
+                break
             await check_partial_results_v2(job_id, job_output_dir, store)
 
         t_log.join(timeout=5)  # let the reader catch main.py's last lines
-        if process.returncode == 0:
+        if timed_out:
+            await store.append_log(job_id, f"Job stopped after {JOB_TIMEOUT_SECONDS}s (timeout).")
+            await store.set_status(job_id, JobStatus.FAILED, TIMEOUT_MESSAGE)
+            remove_job_leftovers(job_output_dir)
+        elif process.returncode == 0:
             await finalize_job_v2(job_id, job_output_dir, store)
         else:
             print(f"v2 Job {job_id} exited with code {process.returncode}")
@@ -364,11 +504,13 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
             else:
                 reason = user_errors.GENERIC[1]
             await store.set_status(job_id, JobStatus.FAILED, reason)
+            remove_job_leftovers(job_output_dir)
 
     except Exception as e:
         print(f"v2 Job {job_id} runner error: {type(e).__name__}: {e}")
         await store.set_status(job_id, JobStatus.FAILED, user_errors.classify(str(e))[1])
     finally:
+        active_job_ids.discard(job_id)
         # Clean up API key from memory
         if job_id in job_api_keys:
             del job_api_keys[job_id]
@@ -862,17 +1004,13 @@ def _has_audio(path: str) -> bool:
 
 
 def _transcribe(video_path: str) -> dict:
-    """Transcribe a local audio/video file with Faster-Whisper."""
-    from faster_whisper import WhisperModel
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(video_path, word_timestamps=False)
-    parts = []
-    total_duration = 0.0
-    for seg in segments:
-        parts.append(seg.text.strip())
-        total_duration = seg.end
-    text = " ".join(parts)
-    return {"text": text, "language": info.language, "duration": total_duration}
+    """Transcribe a local audio/video file with the shared faster-whisper
+    setup (transcription.py: WHISPER_MODEL, VAD, no previous-text conditioning;
+    the model is loaded once per process)."""
+    import transcription
+    result = transcription.transcribe(video_path, word_timestamps=False)
+    return {"text": result["text"], "language": result["language"],
+            "duration": result.get("duration") or 0.0}
 
 
 @app.post("/api/transcribe", response_model=TranscribeResponse)

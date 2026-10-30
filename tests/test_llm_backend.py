@@ -74,7 +74,9 @@ def test_returns_validated_payload_and_zero_cost(local, monkeypatch):
     assert seen["body"]["response_format"]["type"] == "json_schema"
     assert seen["auth"] == "Bearer ollama"  # documented placeholder when no key is set
     assert parsed["windows"][0]["score"] == 88
-    assert cost["total_cost"] == 0.0 and cost["local"] is True
+    # llm.test is a remote host: unknown price, NOT labelled as a free local model.
+    assert cost["total_cost"] == 0.0 and cost["local"] is False
+    assert cost["price_known"] is False and cost["provider"] == "openai-compatible"
     assert cost["input_tokens"] == 120 and cost["output_tokens"] == 40
 
 
@@ -127,7 +129,7 @@ def test_stage_routes_to_local_backend_and_retries_transient(local, monkeypatch)
     monkeypatch.setattr(main.time, "sleep", lambda *_: None)
     calls = {"n": 0}
 
-    def fake_generate(prompt, schema, model=None):
+    def fake_generate(prompt, schema, model=None, endpoint=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectError("ConnectError: connection refused")
@@ -191,3 +193,75 @@ def test_llm_lanes_without_gateway_key_is_deepseek_only(monkeypatch):
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     assert [lane[1] for lane in llm_backend.llm_lanes()] == ["deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"]
+
+
+
+# --- cost labels -----------------------------------------------------------
+
+@pytest.mark.parametrize("url,gateway,label,local", [
+    ("https://inference.baseten.co/v1/chat/completions", False, "baseten", False),
+    ("https://llm.broker-marketplace.com/v1/chat/completions", True, "broker-marketplace-gateway", False),
+    ("http://localhost:11434/v1/chat/completions", False, "local-openai-compatible", True),
+    ("http://127.0.0.1:8080/v1/chat/completions", False, "local-openai-compatible", True),
+])
+def test_endpoint_provider_labels(url, gateway, label, local):
+    assert llm_backend._endpoint_provider(url, gateway) == (label, local)
+
+
+# --- response_format rejection is matched on the field, not on "format" --------
+
+def test_unrelated_400_mentioning_format_is_not_a_format_rejection():
+    resp = httpx.Response(400, text='{"error": "invalid message format in messages[1]"}')
+    assert llm_backend._is_format_rejection(resp) is False
+
+
+def test_response_format_400_is_a_format_rejection():
+    resp = httpx.Response(400, text='{"error": "response_format json_schema is not supported"}')
+    assert llm_backend._is_format_rejection(resp) is True
+    assert llm_backend._is_format_rejection(httpx.Response(500, text="response_format")) is False
+
+
+def test_400_with_bad_message_format_surfaces_instead_of_ladder(local, monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(400, text="invalid date format")
+
+    _serve(handler, monkeypatch)
+    with pytest.raises(RuntimeError) as exc:
+        llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert calls["n"] == 1 and "400" in str(exc.value)
+
+
+# --- transient-error classification ------------------------------------------
+
+class _CodeErr(Exception):
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (RuntimeError("LLM server 503 from https://x/v1/chat/completions: loading"), True),
+    (RuntimeError("LLM server 502 from https://x: bad gateway"), True),
+    (RuntimeError("LLM server 400 from https://x: max_tokens must be <= 500"), False),
+    (RuntimeError("LLM server 401 from https://x: bad key (request 5021)"), False),
+    (RuntimeError("503 UNAVAILABLE. {'error': 'overloaded'}"), True),
+    (RuntimeError("429 RESOURCE_EXHAUSTED"), True),
+    (_CodeErr("whatever", 500), True),
+    (_CodeErr("whatever", 404), False),
+    (httpx.ConnectError("connection refused"), True),
+    (httpx.ReadTimeout("read timed out"), True),
+    (ValueError("Gemini returned an empty response body."), True),
+    (ValueError("schema mismatch at item 500"), False),
+    (RuntimeError("window 502 not found"), False),
+])
+def test_is_transient_error(exc, expected):
+    assert llm_backend.is_transient_error(exc) is expected
+
+
+def test_status_code_from_attributes_and_text():
+    assert llm_backend.error_status_code(_CodeErr("x", 429)) == 429
+    assert llm_backend.error_status_code(RuntimeError("HTTP Error 504: Gateway Timeout")) == 504
+    assert llm_backend.error_status_code(RuntimeError("tokens: 500 used")) is None

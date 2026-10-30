@@ -25,6 +25,7 @@ import json
 from caption_renderer import render_caption_on_frame, extract_words_from_transcript
 import gemini_worker
 import llm_backend
+import speaker_reframe
 import user_errors
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
@@ -83,6 +84,16 @@ class SmoothedCameraman:
         # As long as the target is within this zone relative to current center, DO NOT MOVE.
         self.safe_zone_radius = self.crop_width * 0.25
 
+        # Pan speeds scale with the crop so a 4K source pans as fast (in
+        # screen terms) as a 720p one: ~3 / 15 px per frame on a 608px crop.
+        self.slow_speed = max(1.0, self.crop_width * 0.005)
+        self.fast_speed = max(4.0, self.crop_width * 0.025)
+
+        # Vertical framing (only matters when the crop is shorter than the
+        # source): eyes sit ~1/3 from the top of the crop.
+        self.current_eye_y = None
+        self.target_eye_y = None
+
     def update_target(self, face_box):
         """
         Updates the target center based on detected face/person.
@@ -90,6 +101,8 @@ class SmoothedCameraman:
         if face_box:
             x, y, w, h = face_box
             self.target_center_x = x + w / 2
+            # BlazeFace boxes run brow-to-chin: the eyes are ~38% down.
+            self.target_eye_y = y + h * 0.38
     
     def get_crop_box(self, force_snap=False):
         """
@@ -110,9 +123,9 @@ class SmoothedCameraman:
                 # Speed: 2 pixels per frame (Slow pan)
                 # If the distance is HUGE (scene change or fast movement), speed up slightly
                 if abs(diff) > self.crop_width * 0.5:
-                    speed = 15.0 # Fast re-frame
+                    speed = self.fast_speed  # Fast re-frame
                 else:
-                    speed = 3.0  # Slow, steady pan
+                    speed = self.slow_speed  # Slow, steady pan
                 
                 self.current_center_x += direction * speed
                 
@@ -138,8 +151,17 @@ class SmoothedCameraman:
         x2 = min(self.video_width, x2)
         
         # A source taller than the target aspect trims both ends instead of
-        # pinning y=0 and throwing away the bottom of the frame.
+        # pinning y=0 and throwing away the bottom of the frame — or, with a
+        # face to frame, puts the eyes ~1/3 from the top of the crop.
         y1 = max(0, (self.video_height - self.crop_height) // 2)
+        if self.crop_height < self.video_height and self.target_eye_y is not None:
+            if force_snap or self.current_eye_y is None:
+                self.current_eye_y = self.target_eye_y
+            elif abs(self.target_eye_y - self.current_eye_y) > self.crop_height * 0.08:
+                step = self.slow_speed if self.target_eye_y > self.current_eye_y else -self.slow_speed
+                self.current_eye_y += step
+            y1 = int(self.current_eye_y - self.crop_height / 3)
+            y1 = max(0, min(self.video_height - self.crop_height, y1))
         y2 = y1 + self.crop_height
         
         return x1, y1, x2, y2
@@ -453,6 +475,20 @@ def _is_youtube_url(url):
     return any(h in hostname for h in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
 
 
+def max_download_bytes():
+    """MAX_FILE_SIZE_MB (default 500, the upload limit) in bytes."""
+    try:
+        mb = float(os.environ.get("MAX_FILE_SIZE_MB", "500"))
+    except ValueError:
+        mb = 500.0
+    return int(max(1.0, mb) * 1024 * 1024)
+
+
+def _too_large_message(size_bytes):
+    return (f"file too large: the video is over {max_download_bytes() // (1024 * 1024)} MB "
+            f"({size_bytes // (1024 * 1024)}+ MB)")
+
+
 def _download_direct_url(url, output_dir="."):
     """Download a non-YouTube URL directly using urllib (no yt-dlp overhead)."""
     print(f"📥 Direct download (non-YouTube): {url}")
@@ -468,12 +504,27 @@ def _download_direct_url(url, output_dir="."):
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
-    with urllib.request.urlopen(req, timeout=300) as resp, open(output_path, 'wb') as f:
-        while True:
-            chunk = resp.read(1024 * 1024)  # 1 MB chunks
-            if not chunk:
-                break
-            f.write(chunk)
+    # Same cap as uploads (MAX_FILE_SIZE_MB): a direct link used to stream with
+    # no limit, so one multi-GB file could fill the disk under every job.
+    max_bytes = max_download_bytes()
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp, open(output_path, 'wb') as f:
+            declared = resp.headers.get('Content-Length')
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise RuntimeError(_too_large_message(int(declared)))
+            written = 0
+            while True:
+                chunk = resp.read(1024 * 1024)  # 1 MB chunks
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise RuntimeError(_too_large_message(written))
+                f.write(chunk)
+    except BaseException:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
 
     elapsed = time.time() - step_start_time
     print(f"✅ Downloaded in {elapsed:.2f}s: {output_path}")
@@ -877,16 +928,38 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
         OUTPUT_WIDTH += 1
     if OUTPUT_HEIGHT % 2 != 0:
         OUTPUT_HEIGHT += 1
+    # Phones play 1080x1920: a smaller crop (608x1080 from 1080p) is upscaled
+    # with lanczos instead of shipping a sub-HD short. ffmpeg does it (threaded,
+    # and the pipe carries 3x fewer pixels) unless OpenCV captions are drawn,
+    # which must be drawn at the final size to stay sharp.
+    upscale_vf = []
+    if (not passthrough and OUTPUT_HEIGHT < 1920
+            and os.environ.get("REFRAME_UPSCALE_1080", "1") != "0"):
+        if render_captions:
+            OUTPUT_WIDTH, OUTPUT_HEIGHT = 1080, 1920
+        else:
+            upscale_vf = ['-vf', 'scale=1080:1920:flags=lanczos']
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
     
     # --- New Strategy: Per-Scene Analysis ---
+    # frame_plan (speaker_reframe) decides per frame: blurred GENERAL shot or
+    # a crop on the active speaker, with hard cuts when the speaker changes.
+    frame_plan = None
     if passthrough:
         scene_strategies = ['PASSTHROUGH'] * len(scenes)
     else:
-        print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
-        scene_strategies = analyze_scenes_strategy(input_video, scenes)
+        print("\n   🤖 Step 3: Planning the crop (active speaker per scene)...")
+        try:
+            frame_plan = speaker_reframe.plan_clip(
+                input_video, [(s.get_frames(), e.get_frames()) for s, e in scenes],
+                fps, original_width, original_height, cameraman.crop_width)
+            scene_strategies = ['TRACK'] * len(scenes)
+        except Exception as e:
+            print(f"   ⚠️ Speaker planning failed ({e}); falling back to per-scene face count")
+            frame_plan = None
+            scene_strategies = analyze_scenes_strategy(input_video, scenes)
     # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
     
     print("\n   ✂️ Step 4: Processing video frames...")
@@ -894,7 +967,7 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
     command = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', *video_encode_args(QUALITY_FAST),
+        '-r', str(fps), '-i', '-', *upscale_vf, *video_encode_args(QUALITY_FAST),
         '-pix_fmt', 'yuv420p', '-an', temp_video_output
     ]
 
@@ -928,6 +1001,10 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
             
             # Determine Strategy for current frame based on scene
             current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
+            planned = None
+            if frame_plan:
+                planned = frame_plan[min(frame_number, len(frame_plan) - 1)]
+                current_strategy = planned.mode
             
             # Apply Strategy
             if current_strategy == 'PASSTHROUGH':
@@ -945,22 +1022,29 @@ def process_video_to_vertical(input_video, final_output_video, transcript_words=
                 
             else:
                 # "Single Speaker" -> Track & Crop
-                
-                # Detect every 2nd frame for performance
-                if frame_number % 2 == 0:
-                    candidates = detect_face_candidates(frame)
-                    target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
-                    if target_box:
-                        cameraman.update_target(target_box)
-                    else:
-                        person_box = detect_person_yolo(frame)
-                        if person_box:
-                            cameraman.update_target(person_box)
-
-                # Snap camera on scene change to avoid panning from previous scene position
                 is_scene_start = (frame_number == scene_boundaries[current_scene_index][0])
-                
-                x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
+
+                if planned is not None:
+                    # Planned target; snap = scene start or a speaker change (hard cut).
+                    snap = planned.snap
+                    if planned.box:
+                        cameraman.update_target(planned.box)
+                else:
+                    snap = is_scene_start
+                    # Detect every 2nd frame for performance — and always on a
+                    # scene's first frame, so it never inherits the last shot's face.
+                    if frame_number % 2 == 0 or is_scene_start:
+                        candidates = detect_face_candidates(frame)
+                        target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
+                        if target_box:
+                            cameraman.update_target(target_box)
+                        else:
+                            person_box = detect_person_yolo(frame)
+                            if person_box:
+                                cameraman.update_target(person_box)
+
+                # Snap camera on scene change / speaker change instead of panning
+                x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=snap)
                 
                 # Crop
                 if y2 > y1 and x2 > x1:
@@ -1104,55 +1188,24 @@ def burn_preset_captions(clip_path, transcript, clip_start, clip_end, preset, co
         if os.path.exists(tmp_out):
             os.remove(tmp_out)
 
+import clip_selection  # noqa: E402  (word-boundary helpers used below)
+import clip_qa  # noqa: E402
+import audio_snap  # noqa: E402
+
+
 class NoAudioError(RuntimeError):
     """The source has no audio track, so there is nothing to transcribe."""
 
 
 def transcribe_video(video_path):
+    """Word-timed transcript of the source, via the shared transcription
+    module (WHISPER_MODEL, default "small"; VAD; no conditioning on previous
+    text; continuation fragments merged into their word)."""
     if not has_audio_stream(video_path):
         raise NoAudioError("This video has no audio track")
-    print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
-    from faster_whisper import WhisperModel
-    
-    # Run on CPU with INT8 quantization for speed
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    
-    segments, info = model.transcribe(video_path, word_timestamps=True)
-    
-    print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
-    
-    # Convert to openai-whisper compatible format
-    transcript_segments = []
-    full_text = ""
-    
-    for segment in segments:
-        # Print progress to keep user informed (and prevent timeouts feeling)
-        print(f"   [{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
-        
-        seg_dict = {
-            'text': segment.text,
-            'start': segment.start,
-            'end': segment.end,
-            'words': []
-        }
-        
-        if segment.words:
-            for word in segment.words:
-                seg_dict['words'].append({
-                    'word': word.word,
-                    'start': word.start,
-                    'end': word.end,
-                    'probability': word.probability
-                })
-        
-        transcript_segments.append(seg_dict)
-        full_text += segment.text + " "
-        
-    return {
-        'text': full_text.strip(),
-        'segments': transcript_segments,
-        'language': info.language
-    }
+    import transcription
+    return transcription.transcribe(video_path, word_timestamps=True, log=print,
+                                    echo_segments=True)
 
 
 # --- Clip selection (upstream 2-pass: score windows -> detail shortlist) ----
@@ -1160,13 +1213,9 @@ def transcribe_video(video_path):
 # by BASETEN_API_KEY). Gemini is the fallback when that lane fails, and the
 # only option for the silent-video vision path.
 
-_TRANSIENT_TOKENS = (
-    '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-    '500', 'INTERNAL', 'overloaded', 'Deadline',
-    'empty response body', 'did not contain a JSON object',
-    'Failed to parse Gemini JSON response',
-    'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-    'validation error', 'timed out')
+# Transient-error classification lives in llm_backend.is_transient_error: it
+# matches HTTP status codes properly (exception attributes / a leading or
+# labelled status) instead of any "500"/"502" substring in the message.
 
 
 def _gemini_model_name():
@@ -1204,7 +1253,7 @@ def _run_llm_stage(lane, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in _TRANSIENT_TOKENS)
+            transient = llm_backend.is_transient_error(e)
             if attempt == max_attempts or not transient:
                 raise
             wait = 5 * (2 ** (attempt - 1))
@@ -1264,15 +1313,49 @@ def _lane_label(lane):
     return f"{lane[1]} @ {base}"
 
 
+def snap_shorts(shorts, words, video_duration, min_secs, max_secs):
+    """Move every proposed clip onto sentence boundaries (clip_selection.
+    snap_clip_bounds). A clip with no valid sentence-start/sentence-end pair
+    inside the length band — e.g. one that would have to end on "and" — is
+    dropped; if that would drop EVERY clip, they are re-snapped leniently
+    (nearest whole-word boundaries) so the job still delivers."""
+    def _snap(s, lenient):
+        return clip_selection.snap_clip_bounds(
+            s.get("start", 0), s.get("end", 0), words, video_duration,
+            min_duration=min_secs, max_duration=max_secs, lenient=lenient)
+
+    kept, dropped = [], []
+    for s in shorts:
+        s["proposed"] = [s.get("start", 0), s.get("end", 0)]
+        snap = _snap(s, lenient=False)
+        if snap is None:
+            dropped.append(s)
+            print(f"   ✂️ Dropped clip {s['proposed'][0]}-{s['proposed'][1]}s "
+                  f"({s.get('video_title_for_youtube_short', '')!r}): no complete-sentence "
+                  f"boundaries within {min_secs:g}-{max_secs:g}s.")
+            continue
+        kept.append((s, snap))
+    if not kept and dropped:
+        print("   ⚠️ Every clip failed sentence snapping — keeping them on word boundaries.")
+        for s in dropped:
+            snap = _snap(s, lenient=True)
+            if snap is not None:
+                kept.append((s, snap))
+    out = []
+    for s, snap in kept:
+        s["start"], s["end"] = snap["start"], snap["end"]
+        s["snap"] = dict(snap, cut_start=snap["start"], cut_end=snap["end"])
+        out.append(s)
+    return out
+
+
 def _select_clips_with(lane, transcript_result, video_duration):
     """Two-pass clip selection on one model lane. Returns (shorts, costs)."""
     language = str(transcript_result.get('language') or 'unknown')
 
     # Full word list — ground truth for snapping cut points.
-    words = []
-    for segment in transcript_result['segments']:
-        for word in segment.get('words', []):
-            words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
+    words = clip_selection.normalize_words(
+        [w for segment in transcript_result['segments'] for w in segment.get('words', [])])
 
     # Scoring windows must be able to CONTAIN a max-length clip.
     min_secs, max_secs = clip_duration_bounds()
@@ -1288,6 +1371,17 @@ def _select_clips_with(lane, transcript_result, video_duration):
 
     def _payload(ws):
         return [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in ws]
+
+    def _timed_payload(ws):
+        # Pass 2 sees one "START-END sentence" line per sentence so it can
+        # choose real boundaries (~5 tokens of overhead per sentence; pass 1
+        # stays plain text — it only ranks windows).
+        out = []
+        for w in ws:
+            timed = clip_selection.timed_transcript(words, w["start"], w["end"]) if words else ""
+            out.append({"id": w["id"], "start": w["start"], "end": w["end"],
+                        "transcript": timed or w["text"]})
+        return out
 
     def _score_prompt(ws):
         return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
@@ -1315,7 +1409,7 @@ def _select_clips_with(lane, transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 min_clips=lo, max_clips=hi,
                 min_secs=min_secs, max_secs=max_secs,
-                windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                windows_json=json.dumps(_timed_payload(ws), ensure_ascii=False))
         return build
 
     shorts = _run_stage_split(lane, shortlist,
@@ -1344,12 +1438,7 @@ def _select_clips_with(lane, transcript_result, video_duration):
         shorts = trim_to_best(shorts, max_clips)
         print(f"   Kept the {max_clips} best-scoring clip(s) of {max_clips + dropped}.")
 
-    # Snap each proposed clip onto real word boundaries (+ a bit of silence).
-    for s in shorts:
-        s["proposed"] = [s.get("start", 0), s.get("end", 0)]
-        ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
-                                    min_duration=min_secs, max_duration=max_secs)
-        s["start"], s["end"] = ns, ne
+    shorts = snap_shorts(shorts, words, video_duration, min_secs, max_secs)
     deduped = dedupe_overlapping(shorts)
     if len(deduped) < len(shorts):
         print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a better-scored one.")
@@ -1452,8 +1541,7 @@ def get_visual_clips(video_path, video_duration, language="en"):
                 return None
             time.sleep(2)
 
-        prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
-            video_duration=video_duration, language=language)
+        prompt = gemini_worker.build_visual_prompt(video_duration, language)
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
@@ -1466,8 +1554,11 @@ def get_visual_clips(video_path, video_duration, language="en"):
         # Clamp to the real duration; drop anything degenerate.
         clean = []
         for s in shorts:
-            s["start"] = max(0.0, float(s.get("start", 0)))
-            s["end"] = min(float(video_duration), float(s.get("end", 0)))
+            try:
+                s["start"] = max(0.0, float(s.get("start", 0)))
+                s["end"] = min(float(video_duration), float(s.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
             if s["end"] - s["start"] >= 1.0:
                 clean.append(s)
         if not clean:
@@ -1524,23 +1615,135 @@ def _probe_duration(path):
 
 def render_clip_file(input_video, clip_path, start, end, clip_number, transcript, all_words,
                      caption_style, caption_color, caption_outline_color):
-    """Cut [start, end] from the source, reframe to 9:16 and caption it."""
-    clip_temp_path = os.path.join(os.path.dirname(clip_path),
-                                  f"temp_{uuid.uuid4().hex[:8]}_{os.path.basename(clip_path)}")
+    """Cut [start, end] from the source, reframe to 9:16 and caption it.
+
+    Everything is rendered under a neutral temp name and moved onto
+    ``clip_path`` only when finished: app.py publishes any file named
+    ``*_clip_N.mp4`` as a partial result while the job runs, and used to hand
+    out clips whose audio merge / caption burn was still being written."""
+    out_dir = os.path.dirname(clip_path) or "."
+    token = uuid.uuid4().hex[:8]
+    clip_temp_path = os.path.join(out_dir, f"temp_{token}_{os.path.basename(clip_path)}")
+    render_path = os.path.join(out_dir, f".rendering_{token}.mp4")
     try:
         cut_clip(input_video, clip_temp_path, start, end, clip_number)
         legacy = caption_style in LEGACY_CAPTION_STYLES
         success = process_video_to_vertical(
-            clip_temp_path, clip_path,
+            clip_temp_path, render_path,
             all_words if legacy else None,
             caption_style if legacy else None, caption_color, caption_outline_color,
             clip_offset=start)
         if success and caption_style in ASS_CAPTION_STYLES and transcript:
-            burn_preset_captions(clip_path, transcript, start, end, caption_style, caption_color)
-        return success
+            burn_preset_captions(render_path, transcript, start, end, caption_style, caption_color)
+        if success and os.path.exists(render_path) and os.path.getsize(render_path) > 0:
+            os.replace(render_path, clip_path)
+            return True
+        return False
     finally:
-        if os.path.exists(clip_temp_path):
-            os.remove(clip_temp_path)
+        for leftover in (clip_temp_path, render_path):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+
+def _write_json_atomic(path, data):
+    """Write JSON via temp file + rename so app.py never reads a half-written file."""
+    tmp = f"{path}.{uuid.uuid4().hex[:6]}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _qa_enforced():
+    """CLIP_QA_ENFORCE=0 keeps measuring but publishes every rendered clip."""
+    return os.environ.get("CLIP_QA_ENFORCE", "1").strip() != "0"
+
+
+def _compact_qa(qa):
+    m = qa.get("metrics") or {}
+    return {
+        "passed": bool(qa.get("passed")),
+        "failures": list(qa.get("failures") or []),
+        "duration": m.get("duration"),
+        "lufs": m.get("lufs"),
+        "last_frame_luma": m.get("last_frame_luma"),
+        "ending_problem": m.get("ending_problem"),
+        "double_takes": m.get("double_takes") or [],
+    }
+
+
+def render_clips_with_qa(input_video, output_dir, video_title, shorts, transcript, all_words,
+                         caption_style, caption_color, caption_outline_color,
+                         expect_audio, metadata_file=None, metadata=None):
+    """Render every clip, QA it, and publish only the ones that pass.
+
+    A clip is rendered under a hidden name, measured by clip_qa, and moved to
+    its public ``<title>_clip_N.mp4`` name only if it passes. Failures are
+    deleted and logged — unless NOTHING passed, in which case the best failure
+    is published anyway (a job never ends empty because of the gate). Every
+    clip's verdict lands in its metadata entry as ``qa``.
+    Returns (rendered_count, last_render_error)."""
+    min_secs, max_secs = clip_duration_bounds()
+    src_words = clip_selection.normalize_words(
+        [w for seg in (transcript or {}).get("segments", []) for w in seg.get("words", [])])
+    enforce = _qa_enforced()
+    rendered = 0
+    published = 0
+    last_render_error = None
+    held = []  # (index, hold_path, qa, score)
+
+    for i, clip in enumerate(shorts):
+        start = clip['start']
+        end = clip['end']
+        print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+        print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+        clip_final_path = os.path.join(output_dir, f"{video_title}_clip_{i+1}.mp4")
+        hold_path = os.path.join(output_dir, f".qa_hold_{i+1}_{uuid.uuid4().hex[:6]}.mp4")
+        try:
+            success = render_clip_file(input_video, hold_path, start, end, i + 1,
+                                       transcript, all_words,
+                                       caption_style, caption_color, caption_outline_color)
+        except Exception as e:
+            success = False
+            last_render_error = f"{type(e).__name__}: {e}"
+            print(f"   ❌ Clip {i+1} failed: {last_render_error}")
+        if not success or not os.path.exists(hold_path):
+            continue
+        rendered += 1
+
+        try:
+            qa = clip_qa.qa_clip(hold_path, start, end, src_words, min_secs, max_secs,
+                                 expect_audio=expect_audio)
+        except Exception as e:  # the gate must never cost a clip by crashing
+            print(f"   ⚠️ QA of clip {i+1} errored ({type(e).__name__}: {e}) — publishing it.")
+            qa = {"passed": True, "failures": [], "metrics": {}, "error": str(e)}
+        clip['qa'] = _compact_qa(qa)
+
+        if qa.get("passed") or not enforce:
+            os.replace(hold_path, clip_final_path)
+            published += 1
+            note = "" if qa.get("passed") else f" (QA not enforced: {'; '.join(qa['failures'])})"
+            print(f"   ✅ Clip {i+1} ready: {clip_final_path}{note}")
+        else:
+            print(f"   🧪 Clip {i+1} failed QA: {'; '.join(qa['failures'])}")
+            held.append((i, hold_path, qa, clip.get('predicted_score')))
+
+    if held and published == 0:
+        keep = set(clip_qa.pick_survivors([(i, qa, score) for i, _, qa, score in held]))
+        for i, hold_path, qa, _ in held:
+            if i in keep:
+                os.replace(hold_path, os.path.join(output_dir, f"{video_title}_clip_{i+1}.mp4"))
+                shorts[i]['qa']['kept_despite_failures'] = True
+                published += 1
+                print(f"   ⚠️ Every clip failed QA — publishing the best one (clip {i+1}).")
+    for i, hold_path, _, _ in held:
+        if os.path.exists(hold_path):
+            os.remove(hold_path)
+            shorts[i]['qa']['dropped'] = True
+            print(f"   🗑️ Clip {i+1} dropped by QA.")
+
+    if metadata_file and metadata is not None:
+        _write_json_atomic(metadata_file, metadata)
+    return rendered, last_render_error
 
 
 def run():
@@ -1601,6 +1804,24 @@ def run():
             else:
                 output_dir = os.path.dirname(input_video)
 
+    try:
+        _process(args, input_video, video_title, output_dir)
+    finally:
+        # The downloaded source goes on success AND failure: it sits in the
+        # job's output dir (served under /videos) and is usually the biggest
+        # file the job has.
+        if args.url and not args.keep_original and input_video and os.path.exists(input_video):
+            try:
+                os.remove(input_video)
+                print("🗑️  Cleaned up downloaded video.")
+            except OSError as e:
+                print(f"⚠️ Could not remove the downloaded video: {e}")
+
+    total_time = time.time() - script_start_time
+    print(f"\n⏱️  Total execution time: {total_time:.2f}s")
+
+
+def _process(args, input_video, video_title, output_dir):
     if not os.path.exists(input_video):
         _fail("NOT_A_VIDEO", user_errors.classify("input file not found")[1])
 
@@ -1625,112 +1846,99 @@ def run():
         render_clip_file(input_video, output_file, 0, duration, 1, transcript,
                          extract_words_from_transcript(transcript),
                          caption_style, caption_color, caption_outline_color)
-    else:
-        # Too-short sources cannot yield a 15-60s clip (upstream 730f7de).
-        if MIN_SOURCE_SECONDS > 0 and 0 < duration < MIN_SOURCE_SECONDS:
-            _fail("SOURCE_TOO_SHORT",
-                  f"This video is only {int(duration)}s long — clip generation needs at least "
-                  f"{MIN_SOURCE_SECONDS}s of material to cut from. Use a longer video; this one "
-                  f"is already short-form content you can post as-is.")
+        return
 
-        # 3. Transcribe — unless the video has no audio (or no real speech), in
-        # which case Gemini vision picks clips from the imagery instead.
-        transcript = None
-        try:
-            transcript = transcribe_video(input_video)
-        except NoAudioError as e:
-            print(f"🔇 {e} — switching to visual analysis.")
+    # Too-short sources cannot yield a 15-60s clip (upstream 730f7de).
+    if MIN_SOURCE_SECONDS > 0 and 0 < duration < MIN_SOURCE_SECONDS:
+        _fail("SOURCE_TOO_SHORT",
+              f"This video is only {int(duration)}s long — clip generation needs at least "
+              f"{MIN_SOURCE_SECONDS}s of material to cut from. Use a longer video; this one "
+              f"is already short-form content you can post as-is.")
 
-        try:
-            if transcript is not None and not speech_is_sparse(transcript, duration):
-                clips_data = get_viral_clips(transcript, duration)
-            else:
-                if transcript is not None:
-                    print("🔇 Too little speech to clip by transcript — switching to visual analysis.")
-                clips_data = get_visual_clips(input_video, duration,
-                                              language=(transcript or {}).get('language') or 'en')
-        except gemini_worker.GeminiBlockedError as e:
-            print(f"🚫 {e}")
-            _fail("CONTENT_BLOCKED", CONTENT_BLOCKED_MESSAGE)
+    # 3. Transcribe — unless the video has no audio (or no real speech), in
+    # which case Gemini vision picks clips from the imagery instead.
+    transcript = None
+    source_has_audio = True
+    try:
+        transcript = transcribe_video(input_video)
+    except NoAudioError as e:
+        source_has_audio = False
+        print(f"🔇 {e} — switching to visual analysis.")
 
-        # Extract words for captions (absolute source timestamps)
-        all_words = extract_words_from_transcript(transcript)
-        if transcript is None:
-            transcript = {"language": "none", "segments": [], "text": ""}
-
-        if not clips_data or 'shorts' not in clips_data:
-            # Keep the job useful: one vertical clip from the start of the
-            # video, capped at the max clip length (rendering a whole
-            # hour-long source as a single "clip" helped nobody).
-            _, max_secs = clip_duration_bounds()
-            fallback_end = min(duration, max_secs) if duration else max_secs
-            print(f"⚠️ No clips identified. Creating a single {fallback_end:.0f}s clip as fallback.")
-            output_file = os.path.join(output_dir, f"{video_title}_clip_1.mp4")
-            render_clip_file(input_video, output_file, 0, fallback_end, 1, transcript, all_words,
-                             caption_style, caption_color, caption_outline_color)
-            # Write fallback metadata so app.py can finalize the job
-            fallback_metadata = {
-                "shorts": [{
-                    "start": 0,
-                    "end": fallback_end,
-                    "video_title_for_youtube_short": video_title,
-                    "video_description_for_tiktok": "",
-                    "video_description_for_instagram": ""
-                }],
-                "transcript": transcript
-            }
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(fallback_metadata, f, indent=2)
-            print(f"   Saved fallback metadata to {metadata_file}")
+    try:
+        if transcript is not None and not speech_is_sparse(transcript, duration):
+            clips_data = get_viral_clips(transcript, duration)
         else:
-            print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
-            
-            # Save metadata
-            clips_data['transcript'] = transcript # Save full transcript for subtitles
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(clips_data, f, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
+            if transcript is not None:
+                print("🔇 Too little speech to clip by transcript — switching to visual analysis.")
+            clips_data = get_visual_clips(input_video, duration,
+                                          language=(transcript or {}).get('language') or 'en')
+    except gemini_worker.GeminiBlockedError as e:
+        print(f"🚫 {e}")
+        _fail("CONTENT_BLOCKED", CONTENT_BLOCKED_MESSAGE)
 
-            # 5. Process each clip
-            rendered = 0
-            last_render_error = None
-            for i, clip in enumerate(clips_data['shorts']):
-                start = clip['start']
-                end = clip['end']
-                print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
-                print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-                
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                clip_final_path = os.path.join(output_dir, clip_filename)
+    # Extract words for captions (absolute source timestamps)
+    all_words = extract_words_from_transcript(transcript)
+    if transcript is None:
+        transcript = {"language": "none", "segments": [], "text": ""}
+
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    if not clips_data or 'shorts' not in clips_data:
+        # Keep the job useful: one vertical clip from the start of the
+        # video, capped at the max clip length (rendering a whole
+        # hour-long source as a single "clip" helped nobody).
+        _, max_secs = clip_duration_bounds()
+        fallback_end = min(duration, max_secs) if duration else max_secs
+        print(f"⚠️ No clips identified. Creating a single {fallback_end:.0f}s clip as fallback.")
+        output_file = os.path.join(output_dir, f"{video_title}_clip_1.mp4")
+        render_clip_file(input_video, output_file, 0, fallback_end, 1, transcript, all_words,
+                         caption_style, caption_color, caption_outline_color)
+        # Write fallback metadata so app.py can finalize the job
+        fallback_metadata = {
+            "shorts": [{
+                "start": 0,
+                "end": fallback_end,
+                "video_title_for_youtube_short": video_title,
+                "video_description_for_tiktok": "",
+                "video_description_for_instagram": ""
+            }],
+            "transcript": transcript
+        }
+        _write_json_atomic(metadata_file, fallback_metadata)
+        print(f"   Wrote fallback metadata: {metadata_file}")
+        return
+
+    print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
+
+    # 4. Land every word-snapped cut on the quietest ~10ms around it.
+    if source_has_audio:
+        for clip in clips_data['shorts']:
+            if clip.get('snap'):
                 try:
-                    success = render_clip_file(input_video, clip_final_path, start, end, i + 1,
-                                               transcript, all_words,
-                                               caption_style, caption_color, caption_outline_color)
-                    if success:
-                        rendered += 1
-                        print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+                    audio_snap.refine_clip_cuts(input_video, clip, duration)
                 except Exception as e:
-                    last_render_error = f"{type(e).__name__}: {e}"
-                    print(f"   ❌ Clip {i+1} failed: {last_render_error}")
+                    print(f"   ⚠️ Audio refine skipped for {clip.get('start')}s: {e}")
 
-            if rendered == 0:
-                code, message = user_errors.classify(last_render_error or "")
-                if code == user_errors.GENERIC[0]:
-                    code, message = ("RENDER_FAILED",
-                                     "We picked clips from this video but couldn't render any of "
-                                     "them. Please try again; if it keeps failing, re-export the "
-                                     "video as MP4 (H.264) and upload it.")
-                _fail(code, message)
+    # Save metadata
+    clips_data['transcript'] = transcript  # Save full transcript for subtitles
+    _write_json_atomic(metadata_file, clips_data)
+    print(f"   Wrote metadata: {metadata_file}")
 
-    # Clean up original if requested
-    if args.url and not args.keep_original and os.path.exists(input_video):
-        os.remove(input_video)
-        print(f"🗑️  Cleaned up downloaded video.")
+    # 5. Render + QA each clip
+    rendered, last_render_error = render_clips_with_qa(
+        input_video, output_dir, video_title, clips_data['shorts'], transcript, all_words,
+        caption_style, caption_color, caption_outline_color,
+        expect_audio=source_has_audio,
+        metadata_file=metadata_file, metadata=clips_data)
 
-    total_time = time.time() - script_start_time
-    print(f"\n⏱️  Total execution time: {total_time:.2f}s")
+    if rendered == 0:
+        code, message = user_errors.classify(last_render_error or "")
+        if code == user_errors.GENERIC[0]:
+            code, message = ("RENDER_FAILED",
+                             "We picked clips from this video but couldn't render any of "
+                             "them. Please try again; if it keeps failing, re-export the "
+                             "video as MP4 (H.264) and upload it.")
+        _fail(code, message)
 
 
 CONTENT_BLOCKED_MESSAGE = ("The AI couldn't analyze this video because the provider's safety "

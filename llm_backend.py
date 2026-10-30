@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Optional, Tuple, Type
 
 import httpx
@@ -160,12 +161,87 @@ def _response_formats(schema: Type[BaseModel]):
     yield None
 
 
+_FORMAT_REJECTION_MARKERS = ("response_format", "response format", "json_schema",
+                             "json schema", "json_object", "structured output")
+
+
 def _is_format_rejection(resp: httpx.Response) -> bool:
+    """A 400/422 that complains about the response_format field itself.
+
+    A bare "format" substring used to count, so any 400 whose body mentioned
+    e.g. "invalid message format" or "date format" was retried with a looser
+    response_format and finally surfaced as "rejected every variant"."""
     if resp.status_code not in (400, 422):
         return False
     body = resp.text.lower()
-    return "response_format" in body or "json_schema" in body or "json_object" in body \
-        or "format" in body
+    return any(marker in body for marker in _FORMAT_REJECTION_MARKERS)
+
+
+# --- Transient-error classification (shared with main._run_llm_stage) --------
+TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+_STATUS_PATTERNS = (
+    re.compile(r"^\s*(\d{3})\b"),                       # google-genai: "503 UNAVAILABLE. {...}"
+    re.compile(r"\bLLM server (\d{3})\b"),              # generate_json's own errors
+    re.compile(r"\bstatus(?:[ _]code)?\s*[=:]?\s*(\d{3})\b", re.I),
+    re.compile(r"\bHTTP(?:/[\d.]+)?(?: Error)?\s*(\d{3})\b", re.I),
+    re.compile(r"\b[Ee]rror code:?\s*(\d{3})\b"),
+)
+_TRANSIENT_TEXT = (
+    "UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED", "overloaded", "Deadline",
+    "empty response body", "did not contain a JSON object", "Failed to parse Gemini JSON response",
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    "RemoteProtocolError", "validation error", "timed out", "Internal error",
+    "INTERNAL",
+)
+
+
+def error_status_code(exc) -> Optional[int]:
+    """The HTTP status an exception carries, from its attributes or the
+    message's leading/labelled status — never a bare number in the text (a
+    "500" in "max_tokens 500" or a URL is not a server error)."""
+    for attr in ("code", "status_code", "status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int) and 100 <= v <= 599:
+            return v
+    resp = getattr(exc, "response", None)
+    v = getattr(resp, "status_code", None)
+    if isinstance(v, int) and 100 <= v <= 599:
+        return v
+    msg = str(exc)
+    for pat in _STATUS_PATTERNS:
+        m = pat.search(msg)
+        if m:
+            code = int(m.group(1))
+            if 100 <= code <= 599:
+                return code
+    return None
+
+
+def is_transient_error(exc) -> bool:
+    """Worth retrying: a transient HTTP status, a network/timeout error, or a
+    known flaky-model symptom (empty body, unparseable JSON)."""
+    code = error_status_code(exc)
+    if code is not None:
+        if code in TRANSIENT_STATUS_CODES:
+            return True
+        if 400 <= code < 500:
+            return False  # a client error does not get better by retrying
+    msg = f"{type(exc).__name__}: {exc}"
+    return any(tok in msg for tok in _TRANSIENT_TEXT)
+
+
+def _endpoint_provider(url: str, gateway: bool) -> Tuple[str, bool]:
+    """(provider label, is_local) for cost reporting."""
+    host = (httpx.URL(url).host or "").lower() if url else ""
+    local = host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal") \
+        or host.endswith(".local") or host.endswith(".internal") or host == "ollama"
+    if gateway:
+        return "broker-marketplace-gateway", local
+    if "baseten" in host:
+        return "baseten", local
+    if "openrouter" in host:
+        return "openrouter", local
+    return ("local-openai-compatible" if local else "openai-compatible"), local
 
 
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
@@ -241,15 +317,22 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     validated = schema.model_validate(parsed).model_dump()
 
     usage = data.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    provider_label, local = _endpoint_provider(url, gateway)
+    # No price table for these lanes: the cost is reported as UNKNOWN (0 with
+    # price_known False), not as a free local model — DeepSeek on Baseten and
+    # Haiku through the gateway are billed remote calls.
     cost = {
         "input_tokens": int(usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or 0),
-        "thinking_tokens": 0,
+        "thinking_tokens": int(details.get("reasoning_tokens") or 0),
         "input_cost": 0.0,
         "output_cost": 0.0,
         "total_cost": 0.0,
         "model": model,
+        "provider": provider_label,
         "price_estimated": False,
-        "local": True,
+        "price_known": False,
+        "local": local,
     }
     return validated, cost

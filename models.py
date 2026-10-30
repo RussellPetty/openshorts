@@ -45,6 +45,11 @@ class ClipResult(BaseModel):
     description_youtube: Optional[str] = None
     start: Optional[float] = None  # clip position in the source, seconds
     end: Optional[float] = None
+    # Added fields (optional; older jobs and the fallback clip leave them null)
+    viral_hook_text: Optional[str] = None  # on-screen hook line, max ~10 words
+    predicted_score: Optional[int] = None  # model's 0-100 viral-potential estimate
+    why: Optional[str] = None  # one sentence: what makes this moment a clip
+    qa: Optional[dict] = None  # post-render QA verdict (clip_qa), see main.render_clips_with_qa
 
 
 class JobResult(BaseModel):

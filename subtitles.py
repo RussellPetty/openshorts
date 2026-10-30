@@ -9,54 +9,11 @@ from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
 
 _STDIO_CONFIGURED = False
 
-# Shared faster-whisper config. We stay on "base" (CPU on Railway); override
-# with WHISPER_MODEL=small for better accuracy at roughly 2x the CPU time.
-DEFAULT_WHISPER_MODEL = "base"
-
-
-def get_whisper_config():
-    """Return the faster-whisper model config, overridable via env vars."""
-    return {
-        "model_size": os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
-        "device": os.environ.get("WHISPER_DEVICE", "cpu"),
-        "compute_type": os.environ.get("WHISPER_COMPUTE", "int8"),
-    }
-
-
-# Decode params shared by both transcription paths. condition_on_previous_text
-# is off to avoid repetition/hallucination loops; vad_filter drops silence.
-WHISPER_TRANSCRIBE_PARAMS = {
-    "beam_size": 5,
-    "vad_filter": True,
-    "condition_on_previous_text": False,
-    "word_timestamps": True,
-}
-
-
-def merge_continuation_words(words):
-    """Merge faster-whisper continuation fragments into their base word.
-
-    faster-whisper marks a word boundary with a LEADING SPACE on each token.
-    Compound-word fragments (e.g. "-Kanal.", ".200") arrive WITHOUT a leading
-    space and belong to the preceding word. Without merging, "YouTube" and
-    "-Kanal." get space-joined into "YouTube -Kanal." or split across subtitle
-    blocks. We concatenate such fragments onto the previous word and extend its
-    end time. Normal words keep their leading space, so real word boundaries
-    (e.g. "ich habe") are never glued together.
-
-    Returns a new list; the input dicts are not mutated.
-    """
-    merged = []
-    for word in words:
-        text = word.get("word", "")
-        if merged and isinstance(text, str) and text and not text.startswith(" "):
-            prev = merged[-1]
-            prev["word"] = f"{prev.get('word', '')}{text}"
-            if word.get("end") is not None:
-                prev["end"] = word["end"]
-        else:
-            merged.append(dict(word))
-    return merged
+# Transcription settings live in transcription.py (one setup for every path);
+# re-exported here for existing callers and tests.
+from transcription import (DEFAULT_WHISPER_MODEL, WHISPER_TRANSCRIBE_PARAMS,  # noqa: F401
+                           get_whisper_config, merge_continuation_words)
+import transcription as _transcription
 
 
 def _configure_stdio():
@@ -117,20 +74,8 @@ def transcribe_audio(video_path):
     Transcribe audio from a video file with faster-whisper.
     Returns transcript in the same format as main.py for compatibility.
     """
-    from faster_whisper import WhisperModel
-
     _log(f"🎙️  Transcribing audio from: {video_path}")
-    cfg = get_whisper_config()
-    model = WhisperModel(cfg["model_size"], device=cfg["device"], compute_type=cfg["compute_type"])
-    segments, info = model.transcribe(video_path, **WHISPER_TRANSCRIBE_PARAMS)
-    out = []
-    for seg in segments:
-        words = [{"word": w.word, "start": w.start, "end": w.end,
-                  "probability": w.probability} for w in (seg.words or [])]
-        out.append({"text": seg.text, "start": seg.start, "end": seg.end,
-                    "words": merge_continuation_words(words)})
-    transcript = {"text": " ".join(s["text"].strip() for s in out),
-                  "segments": out, "language": info.language}
+    transcript = _transcription.transcribe(video_path, word_timestamps=True, log=_log)
     _log(f"✅ Transcription complete. Language: {transcript['language']}")
     return transcript
 
