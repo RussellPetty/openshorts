@@ -12,7 +12,13 @@ slice the clip covers:
              so this is checked on the source word timestamps instead), and
              the last word is not a false ending ("and", "the", "to", ...)
   double take no consecutive repeated 3-5-word phrase (a speaker restarting
-             a sentence; Whisper exposes it as the same words twice)
+             a sentence; Whisper exposes it as the same words twice).
+             Grok STT keeps every disfluent repeat, and tighten.py removes
+             the first take — so a repeat that survives because tightening
+             was OFF or SKIPPED it (motion/audio/cap gate) is only a WARNING
+             (``double_takes_fatal=False``): the speaker really said it, and
+             failing such clips would empty jobs. It stays a failure when
+             tightening ran with nothing skipped and the repeat is still there.
 
 ``evaluate()`` is pure (thresholds only) so it is unit-tested without ffmpeg;
 ``qa_clip()`` does the measuring. The orchestrator drops failing clips but
@@ -75,10 +81,10 @@ def ending_problem(words, clip_start, clip_end, tolerance=CHOP_TOLERANCE):
     return None if ok else reason
 
 
-def evaluate(metrics, min_secs, max_secs, expect_audio=True):
+def evaluate(metrics, min_secs, max_secs, expect_audio=True, double_takes_fatal=True):
     """Pure verdict from measured ``metrics``. Returns {"passed", "failures",
-    "metrics"}. Missing measurements (None) never fail a clip."""
-    failures = []
+    "warnings", "metrics"}. Missing measurements (None) never fail a clip."""
+    failures, warnings = [], []
     d = metrics.get("duration")
     if d is None or d <= 0:
         failures.append("duration: unreadable or zero")
@@ -100,8 +106,10 @@ def evaluate(metrics, min_secs, max_secs, expect_audio=True):
     if metrics.get("ending_problem"):
         failures.append(f"ending: {metrics['ending_problem']}")
     for t, phrase in metrics.get("double_takes") or []:
-        failures.append(f"double take at {t:.1f}s: '{phrase}'")
-    return {"passed": not failures, "failures": failures, "metrics": metrics}
+        (failures if double_takes_fatal else warnings).append(
+            f"double take at {t:.1f}s: '{phrase}'")
+    return {"passed": not failures, "failures": failures, "warnings": warnings,
+            "metrics": metrics}
 
 
 # --- measurements -----------------------------------------------------------
@@ -154,7 +162,8 @@ def last_frame_luma(path):
         return None
 
 
-def qa_clip(path, start, end, words, min_secs, max_secs, expect_audio=True):
+def qa_clip(path, start, end, words, min_secs, max_secs, expect_audio=True,
+            double_takes_fatal=True):
     """Measure and judge one rendered clip. ``words`` are whole-source words
     (absolute times); ``start``/``end`` the clip's position in the source."""
     meta = probe(path)
@@ -166,7 +175,8 @@ def qa_clip(path, start, end, words, min_secs, max_secs, expect_audio=True):
     if words:
         metrics["ending_problem"] = ending_problem(words, float(start), float(end))
         metrics["double_takes"] = find_double_takes(words_in_range(words, float(start), float(end)))
-    return evaluate(metrics, min_secs, max_secs, expect_audio=expect_audio)
+    return evaluate(metrics, min_secs, max_secs, expect_audio=expect_audio,
+                    double_takes_fatal=double_takes_fatal)
 
 
 def pick_survivors(results):

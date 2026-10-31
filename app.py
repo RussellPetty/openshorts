@@ -361,6 +361,9 @@ def clip_result_from_metadata(job_id: str, clip_filename: str, clip: dict) -> Cl
         predicted_score=_int_or_none(clip.get('predicted_score')),
         why=clip.get('why') or None,
         qa=qa if isinstance(qa, dict) else None,
+        tightening=clip.get('tightening') if isinstance(clip.get('tightening'), dict) else None,
+        clip_transcript=(clip.get('clip_transcript')
+                         if isinstance(clip.get('clip_transcript'), dict) else None),
     )
 
 
@@ -448,6 +451,8 @@ async def run_job_v2(job_id: str, job_data: JobData, store: RedisJobStore):
             cmd.extend(["--caption-color", job_data.caption_settings.color])
         if job_data.caption_settings.outline_color:
             cmd.extend(["--caption-outline-color", job_data.caption_settings.outline_color])
+    if not job_data.tighten:
+        cmd.append("--no-tighten")
 
     env = os.environ.copy()
     # Get API key from in-memory store
@@ -545,7 +550,8 @@ async def process_v2(
     include_captions: bool = Query(True, description="Include captions in output"),
     caption_style: str = Query("none", description="Caption style"),
     caption_color: Optional[str] = Query(None, description="Hex color for caption text"),
-    caption_outline_color: Optional[str] = Query(None, description="Hex color for caption outline")
+    caption_outline_color: Optional[str] = Query(None, description="Hex color for caption outline"),
+    tighten: bool = Query(True, description="Remove fillers, dead air and double takes inside clips"),
 ):
     """Submit a video for processing (v2 with Redis persistence)."""
     redis = await get_redis()
@@ -596,6 +602,7 @@ async def process_v2(
             color=caption_color,
             outline_color=caption_outline_color
         ),
+        tighten=tighten,
         created_at=datetime.utcnow(),
         logs=[f"Job {job_id} queued."]
     )
@@ -777,9 +784,10 @@ async def add_subtitles_v2(req: SubtitleRequest):
             None,
             lambda: subtitles.add_subtitles_to_video(
                 input_path,
-                job.result.transcript,
-                clip_start=clip.start or 0.0,
-                clip_end=clip.end,
+                # A tightened clip carries its own words on its own timeline.
+                clip.clip_transcript or job.result.transcript,
+                clip_start=0.0 if clip.clip_transcript else (clip.start or 0.0),
+                clip_end=None if clip.clip_transcript else clip.end,
                 position=req.position,
                 preset=req.preset,
             )
@@ -1004,8 +1012,8 @@ def _has_audio(path: str) -> bool:
 
 
 def _transcribe(video_path: str) -> dict:
-    """Transcribe a local audio/video file with the shared faster-whisper
-    setup (transcription.py: WHISPER_MODEL, VAD, no previous-text conditioning;
+    """Transcribe a local audio/video file with the shared transcription
+    module (transcription.py: Grok STT tiers, then faster-whisper WHISPER_MODEL with VAD;
     the model is loaded once per process)."""
     import transcription
     result = transcription.transcribe(video_path, word_timestamps=False)

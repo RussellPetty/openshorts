@@ -275,7 +275,95 @@ def _gpu_cut_ok(input_video):
     return _gpu_cut_sources[input_video]
 
 
-def cut_clip(input_video, clip_temp_path, start, end, clip_number):
+def _piece_fade(duration, fade):
+    if fade <= 0 or duration <= 4 * fade:
+        return ""
+    return (f",afade=t=in:st=0:d={fade:.3f}"
+            f",afade=t=out:st={duration - fade:.4f}:d={fade:.3f}")
+
+
+def _fps_fraction(fps):
+    from fractions import Fraction
+    try:
+        f = Fraction(fps).limit_denominator(1001000) if not isinstance(fps, str) else Fraction(fps)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return f if f > 0 else None
+
+
+def tightened_pieces(keep_ranges, fps=None):
+    """[(start_s, end_s, start_frame, end_frame)] actually cut for ``keep_ranges``.
+
+    With ``fps`` every bound is snapped to the frame grid (round(t*fps)) and
+    the AUDIO uses the snapped times too, so each audio piece is exactly as
+    long as its video piece, the last piece ends on a frame (no 1-frame-short
+    video), and zero-frame pieces are dropped. Without fps the times pass
+    through (frames None)."""
+    f = _fps_fraction(fps) if fps else None
+    out = []
+    for s, e in keep_ranges:
+        if f is None:
+            if e > s:
+                out.append((float(s), float(e), None, None))
+            continue
+        sf, ef = int(round(s * f)), int(round(e * f))
+        if ef > sf:
+            out.append((float(sf / f), float(ef / f), sf, ef))
+    return out
+
+
+def tightened_filtergraph(keep_ranges, join_fade, total_duration=None, fps=None):
+    """trim+concat filtergraph keeping ``keep_ranges`` (clip-relative seconds)
+    of the seeked input, with the SAME intervals for video and audio. Each
+    audio piece fades in/out over ``join_fade`` so no join clicks; loudness
+    normalisation and the clip-edge fades run once on the joined audio, as in
+    the plain cut.
+
+    With ``fps`` (the source's AVERAGE rate) the video is first normalised to
+    constant frame rate — ``fps=<rate>:start_time=0``, so output frame k IS
+    time k/fps, whatever the source's frame timing (VFR screen/meeting
+    recordings) or first-frame offset after the seek — and then trimmed by
+    frame index, with the audio cut at exactly those frame times
+    (tightened_pieces). Without that normalisation a VFR source drifted by
+    seconds across a join: frame-index trims spanned more source time than
+    the time-based audio trims, and concat padded the gap with silence.
+
+    Returns the graph; its output length is sum of piece lengths
+    (tightened_duration)."""
+    pieces = tightened_pieces(keep_ranges, fps)
+    f = _fps_fraction(fps) if fps else None
+    n = len(pieces)
+    if total_duration is None or f is not None:
+        total_duration = sum(e - s for s, e, _, _ in pieces)
+    parts = []
+    if f is not None:
+        parts.append(f"[0:v]fps=fps={f.numerator}/{f.denominator}:start_time=0,split={n}"
+                     + "".join(f"[s{i}]" for i in range(n)))
+    for i, (s, e, sf, ef) in enumerate(pieces):
+        if f is not None:
+            parts.append(f"[s{i}]trim=start_frame={sf}:end_frame={ef},setpts=PTS-STARTPTS[v{i}]")
+        else:
+            parts.append(f"[0:v]trim=start={s:.9f}:end={e:.9f},setpts=PTS-STARTPTS[v{i}]")
+        parts.append(f"[0:a]atrim=start={s:.9f}:end={e:.9f},asetpts=PTS-STARTPTS"
+                     f"{_piece_fade(e - s, join_fade)}[a{i}]")
+    parts.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[outv][cata]")
+    post = []
+    if os.environ.get("AUDIO_NORMALIZE", "1").strip() != "0":
+        post.append(LOUDNORM_FILTER)
+    post.extend(audio_fade_filters(total_duration))
+    # loudnorm flushes a little extra audio at EOF (+67ms measured on a 60s
+    # clip); clamp to the video's exact length so the streams end together.
+    post.append(f"atrim=end={total_duration:.9f}")
+    parts.append(f"[cata]{','.join(post)}[outa]")
+    return ";".join(parts)
+
+
+def tightened_duration(keep_ranges, fps=None):
+    return sum(e - s for s, e, _, _ in tightened_pieces(keep_ranges, fps))
+
+
+def cut_clip(input_video, clip_temp_path, start, end, clip_number, keep_ranges=None,
+             join_fade=0.010, fps=None):
     """Cut [start, end] out of the source into ``clip_temp_path``.
 
     Raises RuntimeError with ffmpeg's own stderr when the cut does not produce
@@ -298,17 +386,28 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         clip_duration = max(0.0, float(end) - float(start))
     except (TypeError, ValueError):
         clip_duration = None
-    command = [
-        'ffmpeg', '-y',
-        '-ss', str(start),
-        '-to', str(end),
-        '-i', input_video,
-        *encode_args,
-        *audio_encode_args(clip_duration),
-        clip_temp_path
-    ]
+    tightened = bool(keep_ranges) and len(keep_ranges) > 1
+    if tightened:
+        # Tightened clip (tighten.py): the same single encode, through a
+        # trim+concat graph. CPU decode — trim/concat need system-memory frames.
+        command = [
+            'ffmpeg', '-y', '-ss', str(start), '-to', str(end), '-i', input_video,
+            '-filter_complex', tightened_filtergraph(keep_ranges, join_fade, fps=fps),
+            '-map', '[outv]', '-map', '[outa]', *encode_args, '-c:a', 'aac',
+            clip_temp_path,
+        ]
+    else:
+        command = [
+            'ffmpeg', '-y',
+            '-ss', str(start),
+            '-to', str(end),
+            '-i', input_video,
+            *encode_args,
+            *audio_encode_args(clip_duration),
+            clip_temp_path
+        ]
     gpu_command = None
-    if _gpu_cut_ok(input_video):
+    if not tightened and _gpu_cut_ok(input_video):
         # CUDA frames are already 4:2:0 (nv12); -pix_fmt would force a copy
         # back to system memory.
         gpu_args = list(encode_args)

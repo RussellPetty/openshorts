@@ -19,8 +19,8 @@ EDGE_PAD = 0.15
 
 
 def transcribe_clip(video_path):
-    """Word-level transcript of a clip via the shared faster-whisper setup
-    (transcription.py: WHISPER_MODEL, VAD, merged word fragments)."""
+    """Word-level transcript of a clip via the shared transcription module
+    (transcription.py: Grok STT tiers, faster-whisper fallback)."""
     import transcription
     result = transcription.transcribe(video_path, word_timestamps=True)
     words = []

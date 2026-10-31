@@ -38,6 +38,7 @@ Submit a video URL to generate short-form clips.
 | `caption_style` | string | No | `none` | Caption style preset (see below) |
 | `caption_color` | string | No | - | Custom text color (hex, e.g., `#FFFFFF`) |
 | `caption_outline_color` | string | No | - | Custom outline color (hex, e.g., `#000000`) |
+| `tighten` | boolean | No | `true` | Remove fillers ("um", "uh", ...), dead air (gaps >= 0.55s, trimmed to ~0.15s) and double takes inside each clip, only where the join is visually seamless. Each clip result then carries `tightening: {removed_seconds, cuts, skipped_for_motion}` and, when something was cut, `clip_transcript` (words on the clip's own timeline). Server switch: `TIGHTEN_CLIPS=0`. |
 
 #### Caption Styles
 

@@ -50,6 +50,12 @@ class ClipResult(BaseModel):
     predicted_score: Optional[int] = None  # model's 0-100 viral-potential estimate
     why: Optional[str] = None  # one sentence: what makes this moment a clip
     qa: Optional[dict] = None  # post-render QA verdict (clip_qa), see main.render_clips_with_qa
+    # {removed_seconds, cuts, skipped_for_motion} from tighten.py (null when off)
+    tightening: Optional[dict] = None
+    # Words on the TIGHTENED clip's own timeline (0 = clip start); set only when
+    # tightening cut something, since start/end-slicing the job transcript no
+    # longer lines up with such a clip.
+    clip_transcript: Optional[dict] = None
 
 
 class JobResult(BaseModel):
@@ -62,6 +68,7 @@ class JobData(BaseModel):
     status: JobStatus = JobStatus.QUEUED
     input_url: str
     caption_settings: CaptionSettings
+    tighten: bool = True  # remove fillers / dead air / double takes inside clips
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

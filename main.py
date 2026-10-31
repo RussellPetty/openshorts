@@ -1191,6 +1191,7 @@ def burn_preset_captions(clip_path, transcript, clip_start, clip_end, preset, co
 import clip_selection  # noqa: E402  (word-boundary helpers used below)
 import clip_qa  # noqa: E402
 import audio_snap  # noqa: E402
+import tighten  # noqa: E402
 
 
 class NoAudioError(RuntimeError):
@@ -1614,8 +1615,14 @@ def _probe_duration(path):
 
 
 def render_clip_file(input_video, clip_path, start, end, clip_number, transcript, all_words,
-                     caption_style, caption_color, caption_outline_color):
+                     caption_style, caption_color, caption_outline_color,
+                     keep_ranges=None, clip_words=None, keep_fps=None):
     """Cut [start, end] from the source, reframe to 9:16 and caption it.
+
+    With ``keep_ranges`` (a tighten.plan, clip-relative) the cut keeps only
+    those stretches, in the same single encode; ``clip_words`` are then the
+    clip's words already on the tightened timeline, and captions use them
+    instead of the source transcript.
 
     Everything is rendered under a neutral temp name and moved onto
     ``clip_path`` only when finished: app.py publishes any file named
@@ -1626,15 +1633,25 @@ def render_clip_file(input_video, clip_path, start, end, clip_number, transcript
     clip_temp_path = os.path.join(out_dir, f"temp_{token}_{os.path.basename(clip_path)}")
     render_path = os.path.join(out_dir, f".rendering_{token}.mp4")
     try:
-        cut_clip(input_video, clip_temp_path, start, end, clip_number)
+        tightened = bool(keep_ranges) and len(keep_ranges) > 1
+        cut_clip(input_video, clip_temp_path, start, end, clip_number,
+                 keep_ranges=keep_ranges if tightened else None,
+                 join_fade=tighten.join_fade_seconds(), fps=keep_fps)
+        cap_words, cap_offset = all_words, start
+        cap_transcript, cap_start, cap_end = transcript, start, end
+        if tightened:
+            cap_words, cap_offset = list(clip_words or []), 0.0
+            cap_transcript = tighten.words_transcript(cap_words)
+            cap_start, cap_end = 0.0, sum(e - s for s, e in keep_ranges)
         legacy = caption_style in LEGACY_CAPTION_STYLES
         success = process_video_to_vertical(
             clip_temp_path, render_path,
-            all_words if legacy else None,
+            cap_words if legacy else None,
             caption_style if legacy else None, caption_color, caption_outline_color,
-            clip_offset=start)
+            clip_offset=cap_offset)
         if success and caption_style in ASS_CAPTION_STYLES and transcript:
-            burn_preset_captions(render_path, transcript, start, end, caption_style, caption_color)
+            burn_preset_captions(render_path, cap_transcript, cap_start, cap_end,
+                                 caption_style, caption_color)
         if success and os.path.exists(render_path) and os.path.getsize(render_path) > 0:
             os.replace(render_path, clip_path)
             return True
@@ -1663,6 +1680,7 @@ def _compact_qa(qa):
     return {
         "passed": bool(qa.get("passed")),
         "failures": list(qa.get("failures") or []),
+        "warnings": list(qa.get("warnings") or []),
         "duration": m.get("duration"),
         "lufs": m.get("lufs"),
         "last_frame_luma": m.get("last_frame_luma"),
@@ -1673,7 +1691,7 @@ def _compact_qa(qa):
 
 def render_clips_with_qa(input_video, output_dir, video_title, shorts, transcript, all_words,
                          caption_style, caption_color, caption_outline_color,
-                         expect_audio, metadata_file=None, metadata=None):
+                         expect_audio, metadata_file=None, metadata=None, tighten_clips=False):
     """Render every clip, QA it, and publish only the ones that pass.
 
     A clip is rendered under a hidden name, measured by clip_qa, and moved to
@@ -1681,6 +1699,11 @@ def render_clips_with_qa(input_video, output_dir, video_title, shorts, transcrip
     deleted and logged — unless NOTHING passed, in which case the best failure
     is published anyway (a job never ends empty because of the gate). Every
     clip's verdict lands in its metadata entry as ``qa``.
+
+    With ``tighten_clips`` each clip is first planned by tighten.py (fillers,
+    dead air, double takes; motion-gated) and cut with those removals; QA then
+    judges the tightened timeline, and the entry gets ``tightening`` plus a
+    ``clip_transcript`` (words on the clip's own timeline) when anything was cut.
     Returns (rendered_count, last_render_error)."""
     min_secs, max_secs = clip_duration_bounds()
     src_words = clip_selection.normalize_words(
@@ -1698,10 +1721,40 @@ def render_clips_with_qa(input_video, output_dir, video_title, shorts, transcrip
         print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
         clip_final_path = os.path.join(output_dir, f"{video_title}_clip_{i+1}.mp4")
         hold_path = os.path.join(output_dir, f".qa_hold_{i+1}_{uuid.uuid4().hex[:6]}.mp4")
+        keep_ranges, clip_words, qa_words, qa_start, qa_end = None, None, src_words, start, end
+        plan = None
+        # Double takes fail QA only when tightening ran and skipped none of
+        # them (clip_qa docstring); otherwise the repeat is a warning.
+        double_takes_fatal = False
+        clip.pop('clip_transcript', None)
+        clip.pop('tightening', None)
+        if tighten_clips and expect_audio and src_words:
+            plan = tighten.plan_for_clip(input_video, float(start), float(end), src_words, min_secs)
+            clip['tightening'] = tighten.summary(plan)
+            double_takes_fatal = plan.get("skipped_double_takes", 0) == 0
+            if plan["cuts"]:
+                keep_ranges = plan["keep"]
+                clip_words = tighten.remap_words(src_words, start, end, keep_ranges)
+                qa_words = tighten.remap_words(src_words, start, end, keep_ranges, context=True)
+                qa_start, qa_end = 0.0, plan["duration"]
+                clip['clip_transcript'] = tighten.words_transcript(
+                    clip_words, language=(transcript or {}).get('language'))
+                kinds = {}
+                for _, _, kind in plan["removed"]:
+                    kinds[kind] = kinds.get(kind, 0) + 1
+                print(f"   ✂️ Tightened: -{plan['removed_seconds']:.2f}s in {plan['cuts']} cuts "
+                      f"({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}); "
+                      f"skipped: {plan['skipped_for_motion']} motion, "
+                      f"{plan['skipped_for_audio']} not quiet, {plan['skipped_for_cap']} cap")
+            elif plan["skipped_for_motion"] or plan["skipped_for_audio"]:
+                print(f"   ✂️ Tightening: nothing cut (skipped: {plan['skipped_for_motion']} motion, "
+                      f"{plan['skipped_for_audio']} not quiet)")
         try:
             success = render_clip_file(input_video, hold_path, start, end, i + 1,
                                        transcript, all_words,
-                                       caption_style, caption_color, caption_outline_color)
+                                       caption_style, caption_color, caption_outline_color,
+                                       keep_ranges=keep_ranges, clip_words=clip_words,
+                                       keep_fps=(plan or {}).get("fps") if keep_ranges else None)
         except Exception as e:
             success = False
             last_render_error = f"{type(e).__name__}: {e}"
@@ -1711,8 +1764,9 @@ def render_clips_with_qa(input_video, output_dir, video_title, shorts, transcrip
         rendered += 1
 
         try:
-            qa = clip_qa.qa_clip(hold_path, start, end, src_words, min_secs, max_secs,
-                                 expect_audio=expect_audio)
+            qa = clip_qa.qa_clip(hold_path, qa_start, qa_end, qa_words, min_secs, max_secs,
+                                 expect_audio=expect_audio,
+                                 double_takes_fatal=double_takes_fatal)
         except Exception as e:  # the gate must never cost a clip by crashing
             print(f"   ⚠️ QA of clip {i+1} errored ({type(e).__name__}: {e}) — publishing it.")
             qa = {"passed": True, "failures": [], "metrics": {}, "error": str(e)}
@@ -1761,6 +1815,9 @@ def run():
                         default='none', help="Caption style to apply")
     parser.add_argument('--caption-color', type=str, help="Custom text color in hex (e.g. #FFFFFF)")
     parser.add_argument('--caption-outline-color', type=str, help="Custom outline color in hex (e.g. #000000)")
+    parser.add_argument('--no-tighten', action='store_true',
+                        help="Keep fillers / dead air / double takes inside clips "
+                             "(TIGHTEN_CLIPS=0 does the same for every job)")
 
     args = parser.parse_args()
 
@@ -1902,7 +1959,8 @@ def _process(args, input_video, video_title, output_dir):
                 "video_description_for_tiktok": "",
                 "video_description_for_instagram": ""
             }],
-            "transcript": transcript
+            "transcript": transcript,
+            "transcription_engine": (transcript or {}).get('engine'),
         }
         _write_json_atomic(metadata_file, fallback_metadata)
         print(f"   Wrote fallback metadata: {metadata_file}")
@@ -1921,6 +1979,7 @@ def _process(args, input_video, video_title, output_dir):
 
     # Save metadata
     clips_data['transcript'] = transcript  # Save full transcript for subtitles
+    clips_data['transcription_engine'] = (transcript or {}).get('engine')
     _write_json_atomic(metadata_file, clips_data)
     print(f"   Wrote metadata: {metadata_file}")
 
@@ -1929,7 +1988,8 @@ def _process(args, input_video, video_title, output_dir):
         input_video, output_dir, video_title, clips_data['shorts'], transcript, all_words,
         caption_style, caption_color, caption_outline_color,
         expect_audio=source_has_audio,
-        metadata_file=metadata_file, metadata=clips_data)
+        metadata_file=metadata_file, metadata=clips_data,
+        tighten_clips=tighten.enabled(not getattr(args, 'no_tighten', False)))
 
     if rendered == 0:
         code, message = user_errors.classify(last_render_error or "")

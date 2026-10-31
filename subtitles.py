@@ -71,7 +71,7 @@ def _normalize_subtitle_word(value):
 
 def transcribe_audio(video_path):
     """
-    Transcribe audio from a video file with faster-whisper.
+    Transcribe audio from a video file (transcription.py: Grok STT, faster-whisper fallback).
     Returns transcript in the same format as main.py for compatibility.
     """
     _log(f"🎙️  Transcribing audio from: {video_path}")
